@@ -1,0 +1,22 @@
+api_version = "2026-07"
+
+[[extensions]]
+name = "t:name"
+handle = "jra-discount-guard"
+type = "function"
+uid = "f6c43e44-c278-453b-e045-f04289d7e3bbc91108d4"
+description = "t:description"
+
+  [[extensions.targeting]]
+  target = "cart.lines.discounts.generate.run"
+  input_query = "src/cart_lines_discounts_generate_run.graphql"
+  export = "cart_lines_discounts_generate_run"
+
+  [extensions.build]
+  command = "cargo build --target=wasm32-unknown-unknown --release"
+  path = "target/wasm32-unknown-unknown/release/jra-discount-guard.wasm"
+  watch = ["src/**/*.rs"]
+
+  [extensions.ui.paths]
+  create = "/app/discount/:functionId/new"
+  details = "/app/discount/:functionId/:id"

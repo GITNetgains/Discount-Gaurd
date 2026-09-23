@@ -1,0 +1,32 @@
+query Input {
+  cart {
+    lines {
+      id
+      quantity
+      cost {
+        amountPerQuantity {
+          amount
+        }
+        compareAtAmountPerQuantity {
+          amount
+        }
+      }
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          product {
+            hasMapRestrictedTag: hasAnyTag(tags: ["MAP Restricted"])
+            mapRestricted: metafield(namespace: "custom", key: "map_restricted") {
+              value
+            }
+          }
+        }
+      }
+    }
+  }
+  discount {
+    metafield(namespace: "$app", key: "function-configuration") {
+      jsonValue
+    }
+  }
+}

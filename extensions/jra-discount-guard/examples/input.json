@@ -1,0 +1,107 @@
+{
+  "cart": {
+    "lines": [
+      {
+        "id": "gid://shopify/CartLine/1",
+        "quantity": 1,
+        "cost": {
+          "amountPerQuantity": {
+            "amount": "100.00"
+          },
+          "compareAtAmountPerQuantity": null
+        },
+        "merchandise": {
+          "__typename": "ProductVariant",
+          "product": {
+            "hasMapRestrictedTag": false,
+            "mapRestricted": null
+          }
+        }
+      },
+      {
+        "id": "gid://shopify/CartLine/2",
+        "quantity": 1,
+        "cost": {
+          "amountPerQuantity": {
+            "amount": "75.00"
+          },
+          "compareAtAmountPerQuantity": {
+            "amount": "100.00"
+          }
+        },
+        "merchandise": {
+          "__typename": "ProductVariant",
+          "product": {
+            "hasMapRestrictedTag": false,
+            "mapRestricted": null
+          }
+        }
+      },
+      {
+        "id": "gid://shopify/CartLine/3",
+        "quantity": 1,
+        "cost": {
+          "amountPerQuantity": {
+            "amount": "350.00"
+          },
+          "compareAtAmountPerQuantity": null
+        },
+        "merchandise": {
+          "__typename": "ProductVariant",
+          "product": {
+            "hasMapRestrictedTag": true,
+            "mapRestricted": null
+          }
+        }
+      },
+      {
+        "id": "gid://shopify/CartLine/4",
+        "quantity": 1,
+        "cost": {
+          "amountPerQuantity": {
+            "amount": "50.00"
+          },
+          "compareAtAmountPerQuantity": null
+        },
+        "merchandise": {
+          "__typename": "ProductVariant",
+          "product": {
+            "hasMapRestrictedTag": false,
+            "mapRestricted": {
+              "value": "true"
+            }
+          }
+        }
+      },
+      {
+        "id": "gid://shopify/CartLine/5",
+        "quantity": 1,
+        "cost": {
+          "amountPerQuantity": {
+            "amount": "60.00"
+          },
+          "compareAtAmountPerQuantity": {
+            "amount": "60.00"
+          }
+        },
+        "merchandise": {
+          "__typename": "ProductVariant",
+          "product": {
+            "hasMapRestrictedTag": false,
+            "mapRestricted": {
+              "value": "false"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "discount": {
+    "metafield": {
+      "jsonValue": {
+        "percentage": 10.0,
+        "message": "10% off eligible regular-priced merchandise"
+      }
+    }
+  }
+}

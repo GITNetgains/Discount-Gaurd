@@ -189,6 +189,25 @@ export async function ensureEligibleCollection(
 ): Promise<EligibleCollection> {
   const existing = await findEligibleCollection(admin);
   if (existing) return { ...existing, created: false };
+  const { collection } = await createEligibleCollection(admin);
+  return { ...collection, created: true };
+}
+
+// Shopify rejects a conditions source with no selections, so the collection is
+// created already populated with the current eligible products.
+async function createEligibleCollection(admin: Pick<AdminApiContext, "graphql">) {
+  const eligibility = await evaluateProducts(admin);
+  const eligibleIds = [...eligibility]
+    .filter(([, eligible]) => eligible)
+    .map(([productId]) => productId);
+
+  if (eligibleIds.length === 0) {
+    throw new Error(
+      "No eligible products found: every product is on sale or MAP Restricted.",
+    );
+  }
+
+  const firstBatch = eligibleIds.slice(0, SELECTION_BATCH_SIZE);
 
   // Collections are unpublished by default, so customers never see this one.
   const data = await runGraphql<{
@@ -207,19 +226,25 @@ export async function ensureEligibleCollection(
           source: {
             title: "Discount Guard eligible products",
             targetType: "PRODUCTS",
-            inclusion: { matchType: "ALL", selections: [] },
+            inclusion: {
+              matchType: "ALL",
+              selections: firstBatch.map((productId) => ({ productId })),
+            },
           },
         },
       ],
     },
   });
   assertNoUserErrors(data.collectionCreate.userErrors);
-  const collection = data.collectionCreate.collection!;
-  return {
-    collectionId: collection.id,
-    sourceId: conditionsSourceId(collection),
-    created: true,
+  const node = data.collectionCreate.collection!;
+  const collection = {
+    collectionId: node.id,
+    sourceId: conditionsSourceId(node),
   };
+
+  await updateSelections(admin, collection, eligibleIds.slice(SELECTION_BATCH_SIZE), []);
+
+  return { collection, eligibility, eligibleCount: eligibleIds.length };
 }
 
 async function updateSelections(
@@ -319,7 +344,17 @@ async function currentMembers(
 export async function syncAllProducts(
   admin: Pick<AdminApiContext, "graphql">,
 ): Promise<SyncResult> {
-  const collection = await ensureEligibleCollection(admin);
+  const collection = await findEligibleCollection(admin);
+  if (!collection) {
+    const created = await createEligibleCollection(admin);
+    return {
+      eligible: created.eligibleCount,
+      excluded: created.eligibility.size - created.eligibleCount,
+      added: created.eligibleCount,
+      removed: 0,
+    };
+  }
+
   const [eligibility, members] = await Promise.all([
     evaluateProducts(admin),
     currentMembers(admin, collection.collectionId),

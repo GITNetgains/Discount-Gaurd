@@ -1,5 +1,5 @@
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
-import { ensureEligibleCollection, syncAllProducts } from "./eligibility.server";
+import { ensureEligibleCollection } from "./eligibility.server";
 
 // Discount Guard codes are native Shopify "amount off products" code discounts
 // scoped to the app-managed eligible-products collection, so they work on every
@@ -118,11 +118,8 @@ export async function createCodeDiscount(
   admin: AdminApiContext,
   values: DiscountFormValues,
 ) {
+  // First code on this store builds the eligible collection from the catalog.
   const collection = await ensureEligibleCollection(admin);
-  // First code on this store: populate the eligible collection before use.
-  if (collection.created) {
-    await syncAllProducts(admin);
-  }
 
   const response = await admin.graphql(CREATE_CODE_DISCOUNT, {
     variables: {

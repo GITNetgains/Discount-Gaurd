@@ -18,19 +18,17 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const discountId = `gid://shopify/DiscountCodeNode/${params.id}`;
   const discountNode = await getDiscount(admin, discountId);
 
-  if (!discountNode || discountNode.discount.__typename !== "DiscountCodeApp") {
+  if (!discountNode || discountNode.discount.__typename !== "DiscountCodeBasic") {
     throw new Response("Discount not found", { status: 404 });
   }
 
-  const configuration = discountNode.metafield?.jsonValue ?? {
-    percentage: 0,
-    message: "",
-  };
+  const fraction = discountNode.discount.customerGets.value.percentage ?? 0;
 
   return {
     discountId,
     discount: discountNode.discount,
-    configuration,
+    // Stored as a fraction (0.1); shown to the merchant as a percent (10).
+    percentage: Math.round(fraction * 10000) / 100,
   };
 };
 
@@ -44,16 +42,12 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     const result = await updateCodeDiscount(admin, discountId, {
       title: payload.title,
       code: payload.code,
-      functionId: params.functionId as string,
+      percentage: Number(payload.percentage),
       startsAt: payload.startsAt,
       endsAt: payload.endsAt || null,
       usageLimit: payload.usageLimit ? Number(payload.usageLimit) : null,
       appliesOncePerCustomer: Boolean(payload.appliesOncePerCustomer),
       combinesWith: payload.combinesWith,
-      configuration: {
-        percentage: Number(payload.percentage),
-        message: payload.message ?? "",
-      },
     });
 
     if (result.userErrors.length > 0) {
@@ -69,14 +63,13 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 };
 
 export default function EditDiscount() {
-  const { discount, configuration } = useLoaderData<typeof loader>();
+  const { discount, percentage: initialPercentage } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
 
   const [title, setTitle] = useState(discount.title);
   const [code, setCode] = useState(discount.codes.nodes[0]?.code ?? "");
-  const [percentage, setPercentage] = useState(String(configuration.percentage ?? 0));
-  const [message, setMessage] = useState(configuration.message ?? "");
+  const [percentage, setPercentage] = useState(String(initialPercentage));
   const [usageLimit, setUsageLimit] = useState(
     discount.usageLimit ? String(discount.usageLimit) : "",
   );
@@ -96,13 +89,17 @@ export default function EditDiscount() {
   }, [fetcher.data, shopify]);
 
   const handleSave = () => {
+    const pct = Number(percentage);
+    if (!percentage || pct <= 0 || pct > 100) {
+      shopify.toast.show("Percentage must be between 1 and 100", { isError: true });
+      return;
+    }
     fetcher.submit(
       {
         discount: JSON.stringify({
           title,
           code,
           percentage,
-          message,
           startsAt: discount.startsAt,
           endsAt: discount.endsAt,
           usageLimit: usageLimit || null,
@@ -165,12 +162,6 @@ export default function EditDiscount() {
             max={100}
             value={percentage}
             onChange={(e: Event) => setPercentage(fieldValue(e))}
-          />
-          <s-text-field
-            label="Cart/checkout message"
-            value={message}
-            onChange={(e: Event) => setMessage(fieldValue(e))}
-            details="Shown to customers next to eligible line items."
           />
           <s-paragraph>
             Sale-priced items (compare-at price greater than current price)

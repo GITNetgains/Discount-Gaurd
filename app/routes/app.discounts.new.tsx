@@ -13,12 +13,12 @@ function checkboxChecked(event: Event) {
   return (event.target as HTMLInputElement).checked;
 }
 
-export const loader = async ({ request, params }: LoaderFunctionArgs) => {
+export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
-  return { functionId: params.functionId as string };
+  return null;
 };
 
-export const action = async ({ request, params }: ActionFunctionArgs) => {
+export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
   const formData = await request.formData();
   const payload = JSON.parse(String(formData.get("discount")));
@@ -27,25 +27,21 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     const result = await createCodeDiscount(admin, {
       title: payload.title,
       code: payload.code,
-      functionId: params.functionId as string,
+      percentage: Number(payload.percentage),
       startsAt: payload.startsAt,
       endsAt: payload.endsAt || null,
       usageLimit: payload.usageLimit ? Number(payload.usageLimit) : null,
       appliesOncePerCustomer: Boolean(payload.appliesOncePerCustomer),
       combinesWith: payload.combinesWith,
-      configuration: {
-        percentage: Number(payload.percentage),
-        message: payload.message ?? "",
-      },
     });
 
     if (result.userErrors.length > 0) {
       return { errors: result.userErrors };
     }
 
-    const discountId = result.codeAppDiscount.discountId as string;
+    const discountId = result.codeDiscountNode.id as string;
     const numericId = discountId.split("/").pop();
-    return redirect(`/app/discount/${params.functionId}/${numericId}`);
+    return redirect(`/app/discounts/${numericId}`);
   } catch (error) {
     return {
       errors: [{ message: error instanceof Error ? error.message : String(error) }],
@@ -60,9 +56,6 @@ export default function NewDiscount() {
   const [title, setTitle] = useState("");
   const [code, setCode] = useState("");
   const [percentage, setPercentage] = useState("10");
-  const [message, setMessage] = useState(
-    "Promotional discount applied to eligible items only.",
-  );
   const [usageLimit, setUsageLimit] = useState("");
   const [appliesOncePerCustomer, setAppliesOncePerCustomer] = useState(false);
   const [combinesWith, setCombinesWith] = useState({
@@ -80,8 +73,9 @@ export default function NewDiscount() {
   }, [fetcher.data, shopify]);
 
   const handleSave = () => {
-    if (!title || !code || !percentage) {
-      shopify.toast.show("Title, code, and percentage are required", {
+    const pct = Number(percentage);
+    if (!title || !code || !percentage || pct <= 0 || pct > 100) {
+      shopify.toast.show("Title, code, and a percentage between 1 and 100 are required", {
         isError: true,
       });
       return;
@@ -92,7 +86,6 @@ export default function NewDiscount() {
           title,
           code,
           percentage,
-          message,
           startsAt: new Date().toISOString(),
           endsAt: null,
           usageLimit: usageLimit || null,
@@ -155,16 +148,11 @@ export default function NewDiscount() {
             value={percentage}
             onChange={(e: Event) => setPercentage(fieldValue(e))}
           />
-          <s-text-field
-            label="Cart/checkout message"
-            value={message}
-            onChange={(e: Event) => setMessage(fieldValue(e))}
-            details="Shown to customers next to eligible line items."
-          />
           <s-paragraph>
             Sale-priced items (compare-at price greater than current price)
             and MAP Restricted products are automatically excluded — no
-            configuration needed.
+            configuration needed. The first code you create may take a moment
+            while the app builds the eligible-products list.
           </s-paragraph>
         </s-stack>
       </s-section>

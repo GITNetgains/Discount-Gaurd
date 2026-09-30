@@ -44,9 +44,12 @@ api_version = "2026-10"
   uri = "/webhooks/app/scopes_update"
   topics = [ "app/scopes_update" ]
 
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/products"
+  topics = [ "products/create", "products/update" ]
+
 [auth]
 redirect_urls = [ "https://jra.netgains.org/api/auth" ]
 
 [build]
-include_config_on_deploy = true
 automatically_update_urls_on_dev = true

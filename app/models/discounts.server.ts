@@ -1,40 +1,31 @@
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
+import { ensureEligibleCollection, syncAllProducts } from "./eligibility.server";
 
-export const CONFIG_NAMESPACE = "$app";
-export const CONFIG_KEY = "function-configuration";
+// Discount Guard codes are native Shopify "amount off products" code discounts
+// scoped to the app-managed eligible-products collection, so they work on every
+// Shopify plan (no Shopify Functions / Shopify Plus required).
 
-export interface DiscountGuardConfiguration {
-  percentage: number;
-  message: string;
+export interface DiscountCombinesWith {
+  orderDiscounts: boolean;
+  productDiscounts: boolean;
+  shippingDiscounts: boolean;
 }
 
 export interface DiscountFormValues {
   title: string;
   code: string;
-  functionId: string;
+  percentage: number;
   startsAt: string;
   endsAt: string | null;
   usageLimit: number | null;
   appliesOncePerCustomer: boolean;
-  combinesWith: {
-    orderDiscounts: boolean;
-    productDiscounts: boolean;
-    shippingDiscounts: boolean;
-  };
-  configuration: DiscountGuardConfiguration;
+  combinesWith: DiscountCombinesWith;
 }
 
 const CREATE_CODE_DISCOUNT = `#graphql
-  mutation CreateCodeDiscount($codeAppDiscount: DiscountCodeAppInput!) {
-    discountCodeAppCreate(codeAppDiscount: $codeAppDiscount) {
-      codeAppDiscount {
-        discountId
-        title
-        status
-        codes(first: 1) {
-          nodes { code }
-        }
-      }
+  mutation CreateCodeDiscount($basicCodeDiscount: DiscountCodeBasicInput!) {
+    discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
+      codeDiscountNode { id }
       userErrors {
         field
         message
@@ -44,16 +35,9 @@ const CREATE_CODE_DISCOUNT = `#graphql
 `;
 
 const UPDATE_CODE_DISCOUNT = `#graphql
-  mutation UpdateCodeDiscount($id: ID!, $codeAppDiscount: DiscountCodeAppInput!) {
-    discountCodeAppUpdate(id: $id, codeAppDiscount: $codeAppDiscount) {
-      codeAppDiscount {
-        discountId
-        title
-        status
-        codes(first: 1) {
-          nodes { code }
-        }
-      }
+  mutation UpdateCodeDiscount($id: ID!, $basicCodeDiscount: DiscountCodeBasicInput!) {
+    discountCodeBasicUpdate(id: $id, basicCodeDiscount: $basicCodeDiscount) {
+      codeDiscountNode { id }
       userErrors {
         field
         message
@@ -68,9 +52,13 @@ const GET_DISCOUNT = `#graphql
       id
       discount {
         __typename
-        ... on DiscountCodeApp {
+        ... on DiscountCodeBasic {
           title
           status
+          startsAt
+          endsAt
+          usageLimit
+          appliesOncePerCustomer
           combinesWith {
             orderDiscounts
             productDiscounts
@@ -79,42 +67,38 @@ const GET_DISCOUNT = `#graphql
           codes(first: 1) {
             nodes { code }
           }
-          startsAt
-          endsAt
-          usageLimit
-          appliesOncePerCustomer
-          appDiscountType {
-            functionId
+          customerGets {
+            value {
+              __typename
+              ... on DiscountPercentage { percentage }
+            }
           }
         }
-      }
-      metafield(namespace: "${CONFIG_NAMESPACE}", key: "${CONFIG_KEY}") {
-        id
-        jsonValue
       }
     }
   }
 `;
 
-function toCodeAppDiscountInput(values: DiscountFormValues) {
+function toBasicCodeDiscountInput(
+  values: DiscountFormValues,
+  collectionId?: string,
+) {
   return {
     title: values.title,
     code: values.code,
-    functionId: values.functionId,
-    discountClasses: ["PRODUCT"],
-    combinesWith: values.combinesWith,
     startsAt: values.startsAt,
     endsAt: values.endsAt,
     usageLimit: values.usageLimit,
     appliesOncePerCustomer: values.appliesOncePerCustomer,
-    metafields: [
-      {
-        namespace: CONFIG_NAMESPACE,
-        key: CONFIG_KEY,
-        type: "json",
-        value: JSON.stringify(values.configuration),
-      },
-    ],
+    combinesWith: values.combinesWith,
+    context: { all: "ALL" },
+    customerGets: {
+      // Shopify expects a fraction: 10% -> 0.1
+      value: { percentage: values.percentage / 100 },
+      ...(collectionId
+        ? { items: { collections: { add: [collectionId] } } }
+        : {}),
+    },
   };
 }
 
@@ -134,12 +118,20 @@ export async function createCodeDiscount(
   admin: AdminApiContext,
   values: DiscountFormValues,
 ) {
+  const collection = await ensureEligibleCollection(admin);
+  // First code on this store: populate the eligible collection before use.
+  if (collection.created) {
+    await syncAllProducts(admin);
+  }
+
   const response = await admin.graphql(CREATE_CODE_DISCOUNT, {
-    variables: { codeAppDiscount: toCodeAppDiscountInput(values) },
+    variables: {
+      basicCodeDiscount: toBasicCodeDiscountInput(values, collection.collectionId),
+    },
   });
   const json = await response.json();
   assertNoTopLevelErrors(json);
-  return json.data.discountCodeAppCreate;
+  return json.data.discountCodeBasicCreate;
 }
 
 export async function updateCodeDiscount(
@@ -147,24 +139,19 @@ export async function updateCodeDiscount(
   discountId: string,
   values: DiscountFormValues,
 ) {
+  // Items are left untouched so the code stays scoped to the eligible collection.
   const response = await admin.graphql(UPDATE_CODE_DISCOUNT, {
     variables: {
       id: discountId,
-      codeAppDiscount: toCodeAppDiscountInput(values),
+      basicCodeDiscount: toBasicCodeDiscountInput(values),
     },
   });
   const json = await response.json();
   assertNoTopLevelErrors(json);
-  return json.data.discountCodeAppUpdate;
+  return json.data.discountCodeBasicUpdate;
 }
 
-export interface DiscountCombinesWith {
-  orderDiscounts: boolean;
-  productDiscounts: boolean;
-  shippingDiscounts: boolean;
-}
-
-export interface DiscountCodeAppNode {
+export interface DiscountCodeBasicNode {
   id: string;
   discount: {
     __typename: string;
@@ -176,15 +163,16 @@ export interface DiscountCodeAppNode {
     endsAt: string | null;
     usageLimit: number | null;
     appliesOncePerCustomer: boolean;
-    appDiscountType: { functionId: string };
+    customerGets: {
+      value: { __typename: string; percentage?: number };
+    };
   };
-  metafield: { id: string; jsonValue: DiscountGuardConfiguration } | null;
 }
 
 export async function getDiscount(
   admin: AdminApiContext,
   discountId: string,
-): Promise<DiscountCodeAppNode | null> {
+): Promise<DiscountCodeBasicNode | null> {
   const response = await admin.graphql(GET_DISCOUNT, {
     variables: { id: discountId },
   });

@@ -8,29 +8,13 @@ import { useFetcher, useLoaderData } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
+import { findEligibleCollection } from "../models/eligibility.server";
+import type { action as resyncAction } from "./app.resync";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
-
-  const response = await admin.graphql(
-    `#graphql
-      query GetDiscountGuardFunction {
-        shopifyFunctions(first: 25) {
-          nodes {
-            id
-            apiType
-            handle
-          }
-        }
-      }`,
-  );
-  const json = await response.json();
-  const discountFunction = json.data.shopifyFunctions.nodes.find(
-    (fn: { apiType: string; handle: string }) =>
-      fn.apiType === "discount" && fn.handle === "jra-discount-guard",
-  );
-
-  return { discountFunctionId: discountFunction?.id ?? null };
+  const collection = await findEligibleCollection(admin);
+  return { eligibleCollectionId: collection?.collectionId ?? null };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -146,19 +130,31 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function Index() {
-  const { discountFunctionId } = useLoaderData<typeof loader>();
+  const { eligibleCollectionId } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
+  const resync = useFetcher<typeof resyncAction>();
 
   const shopify = useAppBridge();
   const isLoading =
     ["loading", "submitting"].includes(fetcher.state) &&
     fetcher.formMethod === "POST";
+  const isResyncing = resync.state !== "idle";
 
   useEffect(() => {
     if (fetcher.data?.product?.id) {
       shopify.toast.show("Product created");
     }
   }, [fetcher.data?.product?.id, shopify]);
+
+  useEffect(() => {
+    if (!resync.data) return;
+    if ("error" in resync.data && resync.data.error) {
+      shopify.toast.show(resync.data.error, { isError: true });
+    } else if ("result" in resync.data && resync.data.result) {
+      const { eligible, excluded } = resync.data.result;
+      shopify.toast.show(`Resynced: ${eligible} eligible, ${excluded} excluded`);
+    }
+  }, [resync.data, shopify]);
 
   const generateProduct = () => fetcher.submit({}, { method: "POST" });
 
@@ -169,20 +165,39 @@ export default function Index() {
       </s-button>
 
       <s-section heading="Discount Guard">
-        <s-paragraph>
-          Create an app-powered promotional code that automatically excludes
-          sale-priced and MAP Restricted items.
-        </s-paragraph>
-        {discountFunctionId ? (
-          <s-button href={`/app/discount/${discountFunctionId}/new`} variant="primary">
-            Create Discount Guard code
-          </s-button>
-        ) : (
+        <s-stack direction="block" gap="base">
           <s-paragraph>
-            Run <s-text>shopify app deploy</s-text> to register the Discount
-            Guard function, then reload this page.
+            Create a promotional code that automatically excludes sale-priced
+            and MAP Restricted items. Works on every Shopify plan: codes are
+            native Shopify discounts limited to an app-managed, hidden
+            &quot;Discount Guard – Eligible&quot; collection that updates
+            automatically when products change. Do not edit or delete that
+            collection.
           </s-paragraph>
-        )}
+          {resync.data && "result" in resync.data && resync.data.result && (
+            <s-banner tone="success" heading="Eligible products resynced">
+              {resync.data.result.eligible} eligible,{" "}
+              {resync.data.result.excluded} excluded (
+              {resync.data.result.added} added, {resync.data.result.removed}{" "}
+              removed).
+            </s-banner>
+          )}
+          <s-stack direction="inline" gap="base">
+            <s-button href="/app/discounts/new" variant="primary">
+              Create Discount Guard code
+            </s-button>
+            {eligibleCollectionId && (
+              <s-button
+                onClick={() =>
+                  resync.submit({}, { method: "POST", action: "/app/resync" })
+                }
+                {...(isResyncing ? { loading: true } : {})}
+              >
+                Resync eligible products
+              </s-button>
+            )}
+          </s-stack>
+        </s-stack>
       </s-section>
 
       <s-section heading="Congrats on creating a new Shopify app 🎉">

@@ -5,21 +5,22 @@ import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
 
 type Admin = Pick<AdminApiContext, "graphql">;
 
-export interface MatchedProduct {
+/** One product as seen in a scan chunk (a product can span two chunks). */
+export interface ScannedProduct {
   id: string;
   title: string;
   vendor: string;
+  tags: string[];
+  /** Some variant has compare-at price greater than its price. */
   onSale: boolean;
-  hasTag: boolean;
-}
-
-export interface FindFilters {
-  vendors: string[];
-  onSaleOnly: boolean;
-  tag: string;
+  /** Some variant has any compare-at price set. */
+  hasCompareAt: boolean;
 }
 
 const MUTATION_BATCH_SIZE = 10;
+// Variant pages (250 each) per scan request; keeps each request well under
+// proxy timeouts even on large catalogs.
+const SCAN_PAGES_PER_CHUNK = 6;
 
 const PRODUCT_VENDORS = `#graphql
   query ProductVendors($cursor: String) {
@@ -93,19 +94,16 @@ export async function listVendors(admin: Admin) {
 }
 
 /**
- * Products matching ALL chosen filters: vendor in `vendors` (when any are
- * chosen) and, with `onSaleOnly`, at least one variant with compare-at > price.
+ * Scans the next chunk of the catalog (every variant of every product,
+ * any status). Call repeatedly with the returned cursor until it is null;
+ * the client merges products that span chunks.
  */
-export async function findProducts(
-  admin: Admin,
-  filters: FindFilters,
-): Promise<MatchedProduct[]> {
-  const vendorSet = new Set(filters.vendors);
-  const tag = filters.tag.trim().toLowerCase();
-  const products = new Map<string, MatchedProduct>();
-  let cursor: string | null = null;
+export async function scanCatalogChunk(admin: Admin, startCursor: string | null) {
+  const products = new Map<string, ScannedProduct>();
+  let cursor = startCursor;
+  let variantsScanned = 0;
 
-  do {
+  for (let page = 0; page < SCAN_PAGES_PER_CHUNK; page += 1) {
     const data: {
       productVariants: {
         pageInfo: { hasNextPage: boolean; endCursor: string | null };
@@ -119,33 +117,35 @@ export async function findProducts(
 
     for (const variant of data.productVariants.nodes) {
       const { product } = variant;
-      if (vendorSet.size && !vendorSet.has(product.vendor)) continue;
-
+      const hasCompareAt =
+        variant.compareAtPrice !== null && Number(variant.compareAtPrice) > 0;
       const onSale =
-        variant.compareAtPrice !== null &&
-        Number(variant.compareAtPrice) > Number(variant.price);
+        hasCompareAt && Number(variant.compareAtPrice) > Number(variant.price);
+
       const existing = products.get(product.id);
       if (existing) {
         existing.onSale ||= onSale;
+        existing.hasCompareAt ||= hasCompareAt;
       } else {
         products.set(product.id, {
           id: product.id,
           title: product.title,
           vendor: product.vendor,
+          tags: product.tags,
           onSale,
-          hasTag: product.tags.some((t) => t.trim().toLowerCase() === tag),
+          hasCompareAt,
         });
       }
     }
+    variantsScanned += data.productVariants.nodes.length;
 
     cursor = data.productVariants.pageInfo.hasNextPage
       ? data.productVariants.pageInfo.endCursor
       : null;
-  } while (cursor);
+    if (!cursor) break;
+  }
 
-  return [...products.values()]
-    .filter((p) => !filters.onSaleOnly || p.onSale)
-    .sort((a, b) => a.vendor.localeCompare(b.vendor) || a.title.localeCompare(b.title));
+  return { products: [...products.values()], variantsScanned, nextCursor: cursor };
 }
 
 /** Adds or removes `tag` on the given products. Returns per-product failures. */

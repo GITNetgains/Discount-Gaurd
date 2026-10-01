@@ -5,14 +5,18 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import {
   applyTag,
-  findProducts,
   listVendors,
-  type MatchedProduct,
+  scanCatalogChunk,
+  type ScannedProduct,
 } from "../models/bulk-tag.server";
 
 const DEFAULT_TAG = "MAP Restricted";
 const APPLY_CHUNK_SIZE = 50;
 const PREVIEW_ROWS = 100;
+
+type CompareMode = "off" | "onSale" | "any";
+type TagMode = "add" | "remove";
+type PreviewView = "matching" | "toAdd" | "toRemove";
 
 function fieldValue(event: Event) {
   return (event.target as HTMLInputElement).value;
@@ -21,6 +25,8 @@ function fieldValue(event: Event) {
 function checkboxChecked(event: Event) {
   return (event.target as HTMLInputElement).checked;
 }
+
+const normalize = (value: string) => value.trim().toLowerCase();
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
@@ -33,13 +39,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const intent = String(formData.get("intent"));
 
   try {
-    if (intent === "find") {
-      const products = await findProducts(admin, {
-        vendors: JSON.parse(String(formData.get("vendors") ?? "[]")),
-        onSaleOnly: formData.get("onSaleOnly") === "true",
-        tag: String(formData.get("tag") ?? ""),
-      });
-      return { intent, products };
+    if (intent === "scan") {
+      const cursor = String(formData.get("cursor") ?? "") || null;
+      return { intent, ...(await scanCatalogChunk(admin, cursor)) };
     }
 
     if (intent === "add" || intent === "remove") {
@@ -47,7 +49,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const tag = String(formData.get("tag") ?? "").trim();
       if (!tag) return { intent, error: "Tag is required." };
       const failures = await applyTag(admin, ids, tag, intent);
-      return { intent, processed: ids.length, failures };
+      return { intent, ids, failures };
     }
 
     return { intent, error: "Unknown action." };
@@ -59,126 +61,242 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 type ActionData = {
   intent: string;
   error?: string;
-  products?: MatchedProduct[];
-  processed?: number;
+  // scan
+  products?: ScannedProduct[];
+  variantsScanned?: number;
+  nextCursor?: string | null;
+  // add / remove
+  ids?: string[];
   failures?: { id: string; message: string }[];
 };
+
+interface ApplyChunk {
+  mode: TagMode;
+  ids: string[];
+}
 
 export default function BulkTag() {
   const { vendors } = useLoaderData<typeof loader>();
   const shopify = useAppBridge();
-  const findFetcher = useFetcher<ActionData>();
+  const scanFetcher = useFetcher<ActionData>();
   const applyFetcher = useFetcher<ActionData>();
 
   const [tag, setTag] = useState(DEFAULT_TAG);
   const [vendorSearch, setVendorSearch] = useState("");
   const [selectedVendors, setSelectedVendors] = useState<string[]>([]);
-  const [onSaleOnly, setOnSaleOnly] = useState(false);
+  const [compareMode, setCompareMode] = useState<CompareMode>("off");
+  const [view, setView] = useState<PreviewView>("matching");
+  const [confirmSync, setConfirmSync] = useState(false);
 
-  const [products, setProducts] = useState<MatchedProduct[] | null>(null);
+  // Catalog scan: products keyed by id, merged across chunks.
+  const catalogRef = useRef(new Map<string, ScannedProduct>());
+  const [catalog, setCatalog] = useState<ScannedProduct[] | null>(null);
+  const [scan, setScan] = useState<{ running: boolean; variants: number } | null>(null);
+  const lastScanData = useRef<ActionData | undefined>(undefined);
+
+  // Chunked add/remove queue.
+  const queueRef = useRef<ApplyChunk[]>([]);
+  const lastApplyData = useRef<ActionData | undefined>(undefined);
   const [progress, setProgress] = useState<{
-    mode: "add" | "remove";
+    label: string;
     done: number;
     total: number;
-    failures: number;
+    failures: string[];
+    running: boolean;
   } | null>(null);
-  const queueRef = useRef<string[]>([]);
-  const lastApplyData = useRef<ActionData | undefined>(undefined);
 
   const visibleVendors = useMemo(() => {
-    const q = vendorSearch.trim().toLowerCase();
+    const q = normalize(vendorSearch);
     return q ? vendors.filter((v) => v.toLowerCase().includes(q)) : vendors;
   }, [vendors, vendorSearch]);
 
-  const finding = findFetcher.state !== "idle";
-  const applying = progress !== null && progress.done < progress.total;
+  // ---- Matching (OR across rules), evaluated live on the scanned catalog ----
+  const tagKey = normalize(tag);
+  const vendorKeys = useMemo(
+    () => new Set(selectedVendors.map(normalize)),
+    [selectedVendors],
+  );
+  const hasRules = vendorKeys.size > 0 || compareMode !== "off";
 
-  useEffect(() => {
-    const data = findFetcher.data;
-    if (!data || data.intent !== "find") return;
-    if (data.error) shopify.toast.show(data.error, { isError: true });
-    else setProducts(data.products ?? []);
-  }, [findFetcher.data, shopify]);
+  const { matching, toAdd, toRemove, hasTagCount } = useMemo(() => {
+    const matching: (ScannedProduct & { reason: string; hasTag: boolean })[] = [];
+    const toAdd: string[] = [];
+    const toRemove: (ScannedProduct & { reason: string; hasTag: boolean })[] = [];
+    let hasTagCount = 0;
 
-  const submitNextChunk = (mode: "add" | "remove") => {
-    const chunk = queueRef.current.splice(0, APPLY_CHUNK_SIZE);
-    applyFetcher.submit(
-      { intent: mode, tag: tag.trim(), ids: JSON.stringify(chunk) },
-      { method: "post" },
-    );
+    for (const p of catalog ?? []) {
+      const hasTag = !!tagKey && p.tags.some((t) => normalize(t) === tagKey);
+      if (hasTag) hasTagCount += 1;
+
+      const reasons: string[] = [];
+      if (vendorKeys.has(normalize(p.vendor))) reasons.push("Vendor");
+      if (compareMode === "onSale" && p.onSale) reasons.push("Compare-at > price");
+      if (compareMode === "any" && p.hasCompareAt) reasons.push("Has compare-at");
+
+      const row = { ...p, reason: reasons.join(", "), hasTag };
+      if (reasons.length) {
+        matching.push(row);
+        if (!hasTag) toAdd.push(p.id);
+      } else if (hasTag) {
+        toRemove.push({ ...row, reason: "No rule matches" });
+      }
+    }
+
+    const byVendorTitle = (a: ScannedProduct, b: ScannedProduct) =>
+      a.vendor.localeCompare(b.vendor) || a.title.localeCompare(b.title);
+    matching.sort(byVendorTitle);
+    toRemove.sort(byVendorTitle);
+    return { matching, toAdd, toRemove, hasTagCount };
+  }, [catalog, tagKey, vendorKeys, compareMode]);
+
+  const matchingWithTag = matching.filter((p) => p.hasTag);
+  const applying = !!progress?.running;
+  const scanning = !!scan?.running;
+
+  // ---- Scan loop ----
+  const startScan = () => {
+    catalogRef.current = new Map();
+    setCatalog(null);
+    setProgress(null);
+    setConfirmSync(false);
+    setScan({ running: true, variants: 0 });
+    scanFetcher.submit({ intent: "scan", cursor: "" }, { method: "post" });
   };
 
-  // Drive the chunked add/remove: each finished chunk submits the next one.
   useEffect(() => {
-    const data = applyFetcher.data;
-    if (applyFetcher.state !== "idle" || !data || data === lastApplyData.current) return;
-    lastApplyData.current = data;
-    if (!progress) return;
+    const data = scanFetcher.data;
+    if (scanFetcher.state !== "idle" || !data || data === lastScanData.current) return;
+    lastScanData.current = data;
+    if (data.intent !== "scan") return;
 
     if (data.error) {
-      queueRef.current = [];
-      setProgress(null);
+      setScan(null);
       shopify.toast.show(data.error, { isError: true });
       return;
     }
 
-    const next = {
-      ...progress,
-      done: progress.done + (data.processed ?? 0),
-      failures: progress.failures + (data.failures?.length ?? 0),
-    };
-    setProgress(next);
+    const map = catalogRef.current;
+    for (const p of data.products ?? []) {
+      const existing = map.get(p.id);
+      if (existing) {
+        existing.onSale ||= p.onSale;
+        existing.hasCompareAt ||= p.hasCompareAt;
+      } else {
+        map.set(p.id, { ...p });
+      }
+    }
 
-    if (queueRef.current.length) {
-      submitNextChunk(progress.mode);
+    const variants = (scan?.variants ?? 0) + (data.variantsScanned ?? 0);
+    if (data.nextCursor) {
+      setScan({ running: true, variants });
+      scanFetcher.submit({ intent: "scan", cursor: data.nextCursor }, { method: "post" });
     } else {
-      shopify.toast.show(
-        `${progress.mode === "add" ? "Tagged" : "Untagged"} ${next.done - next.failures} products` +
-          (next.failures ? `, ${next.failures} failed` : ""),
-        next.failures ? { isError: true } : undefined,
-      );
-      // Refresh the preview so the "Has tag" column is current.
-      handleFind();
+      setScan({ running: false, variants });
+      setCatalog([...map.values()]);
+      shopify.toast.show(`Scanned ${map.size} products`);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [applyFetcher.state, applyFetcher.data]);
+  }, [scanFetcher.state, scanFetcher.data]);
 
-  const handleFind = () => {
-    if (!selectedVendors.length && !onSaleOnly) {
-      shopify.toast.show("Select at least one vendor or the compare-at price filter", {
-        isError: true,
-      });
+  // ---- Apply loop ----
+  const runJobs = (label: string, jobs: ApplyChunk[]) => {
+    const chunks: ApplyChunk[] = [];
+    for (const job of jobs) {
+      for (let i = 0; i < job.ids.length; i += APPLY_CHUNK_SIZE) {
+        chunks.push({ mode: job.mode, ids: job.ids.slice(i, i + APPLY_CHUNK_SIZE) });
+      }
+    }
+    const total = chunks.reduce((sum, c) => sum + c.ids.length, 0);
+    if (!total) {
+      shopify.toast.show("Nothing to change");
       return;
     }
-    findFetcher.submit(
-      {
-        intent: "find",
-        tag: tag.trim(),
-        vendors: JSON.stringify(selectedVendors),
-        onSaleOnly: String(onSaleOnly),
-      },
+    queueRef.current = chunks;
+    setConfirmSync(false);
+    setProgress({ label, done: 0, total, failures: [], running: true });
+    submitNextChunk();
+  };
+
+  const submitNextChunk = () => {
+    const chunk = queueRef.current.shift();
+    if (!chunk) return;
+    applyFetcher.submit(
+      { intent: chunk.mode, tag: tag.trim(), ids: JSON.stringify(chunk.ids) },
       { method: "post" },
     );
   };
 
-  const handleApply = (mode: "add" | "remove") => {
+  useEffect(() => {
+    const data = applyFetcher.data;
+    if (applyFetcher.state !== "idle" || !data || data === lastApplyData.current) return;
+    lastApplyData.current = data;
+    if (!progress?.running) return;
+
+    if (data.error) {
+      queueRef.current = [];
+      setProgress({ ...progress, running: false });
+      shopify.toast.show(data.error, { isError: true });
+      return;
+    }
+
+    // Reflect successful changes in the local catalog so counts stay current.
+    const failed = new Set((data.failures ?? []).map((f) => f.id));
+    const tagValue = tag.trim();
+    for (const id of data.ids ?? []) {
+      if (failed.has(id)) continue;
+      const p = catalogRef.current.get(id);
+      if (!p) continue;
+      p.tags =
+        data.intent === "add"
+          ? [...p.tags, tagValue]
+          : p.tags.filter((t) => normalize(t) !== normalize(tagValue));
+    }
+    setCatalog([...catalogRef.current.values()]);
+
+    const next = {
+      ...progress,
+      done: progress.done + (data.ids?.length ?? 0),
+      failures: [...progress.failures, ...(data.failures ?? []).map((f) => `${f.id}: ${f.message}`)],
+    };
+
+    if (queueRef.current.length) {
+      setProgress(next);
+      submitNextChunk();
+    } else {
+      setProgress({ ...next, running: false });
+      shopify.toast.show(
+        `${next.label}: ${next.done - next.failures.length} products updated` +
+          (next.failures.length ? `, ${next.failures.length} failed` : ""),
+        next.failures.length ? { isError: true } : undefined,
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applyFetcher.state, applyFetcher.data]);
+
+  const requireTag = () => {
     if (!tag.trim()) {
       shopify.toast.show("Enter a tag", { isError: true });
-      return;
+      return false;
     }
-    if (!products?.length) return;
-    const ids = products
-      .filter((p) => (mode === "add" ? !p.hasTag : p.hasTag))
-      .map((p) => p.id);
-    if (!ids.length) {
-      shopify.toast.show(
-        mode === "add" ? "All matched products already have this tag" : "No matched products have this tag",
-      );
-      return;
-    }
-    queueRef.current = [...ids];
-    setProgress({ mode, done: 0, total: ids.length, failures: 0 });
-    submitNextChunk(mode);
+    return true;
+  };
+
+  const handleAdd = () => {
+    if (!requireTag()) return;
+    runJobs("Add tag", [{ mode: "add", ids: toAdd }]);
+  };
+
+  const handleRemoveFromMatching = () => {
+    if (!requireTag()) return;
+    runJobs("Remove tag", [{ mode: "remove", ids: matchingWithTag.map((p) => p.id) }]);
+  };
+
+  const handleSync = () => {
+    if (!requireTag() || !hasRules) return;
+    runJobs("Sync", [
+      { mode: "add", ids: toAdd },
+      { mode: "remove", ids: toRemove.map((p) => p.id) },
+    ]);
   };
 
   const toggleVendor = (vendor: string, checked: boolean) =>
@@ -186,8 +304,12 @@ export default function BulkTag() {
       checked ? [...prev, vendor] : prev.filter((v) => v !== vendor),
     );
 
-  const taggedCount = products?.filter((p) => p.hasTag).length ?? 0;
-  const onSaleCount = products?.filter((p) => p.onSale).length ?? 0;
+  const previewRows =
+    view === "toRemove"
+      ? toRemove
+      : view === "toAdd"
+        ? matching.filter((p) => !p.hasTag)
+        : matching;
 
   return (
     <s-page heading="Bulk tag products">
@@ -196,34 +318,39 @@ export default function BulkTag() {
       </s-link>
 
       <s-section heading="1. Tag">
-        <s-stack direction="block" gap="base">
-          <s-text-field
-            label="Tag to add or remove"
-            value={tag}
-            onChange={(e: Event) => setTag(fieldValue(e))}
-            details={`Discount Guard excludes products tagged "${DEFAULT_TAG}".`}
-          />
-        </s-stack>
+        <s-text-field
+          label="Tag"
+          value={tag}
+          onChange={(e: Event) => setTag(fieldValue(e))}
+          details={`Discount Guard excludes products tagged "${DEFAULT_TAG}". Tag matching ignores upper/lower case.`}
+        />
       </s-section>
 
-      <s-section heading="2. Filter products">
+      <s-section heading="2. Rules (a product matches if ANY rule matches)">
         <s-stack direction="block" gap="base">
+          <s-select
+            label="Compare-at price rule"
+            value={compareMode}
+            onChange={(e: Event) => setCompareMode(fieldValue(e) as CompareMode)}
+          >
+            <s-option value="off">Off — ignore compare-at price</s-option>
+            <s-option value="onSale">
+              Compare-at price greater than price (on sale)
+            </s-option>
+            <s-option value="any">Any compare-at price set</s-option>
+          </s-select>
+
           <s-paragraph>
-            Selected vendors ({selectedVendors.length}):{" "}
+            Vendors ({selectedVendors.length} selected):{" "}
             {selectedVendors.length ? selectedVendors.join(", ") : "none"}
           </s-paragraph>
           <s-text-field
             label="Search vendors"
             value={vendorSearch}
             onChange={(e: Event) => setVendorSearch(fieldValue(e))}
+            details="Vendor matching ignores upper/lower case and extra spaces."
           />
-          <s-box
-            padding="base"
-            borderWidth="base"
-            borderRadius="base"
-            maxBlockSize="300px"
-            overflow="hidden"
-          >
+          <s-box padding="base" borderWidth="base" borderRadius="base">
             <div style={{ maxHeight: "280px", overflowY: "auto" }}>
               <s-stack direction="block" gap="small-200">
                 {visibleVendors.map((vendor) => (
@@ -240,85 +367,157 @@ export default function BulkTag() {
               </s-stack>
             </div>
           </s-box>
-          <s-checkbox
-            label="Only products with a compare-at price (on sale)"
-            checked={onSaleOnly}
-            onChange={(e: Event) => setOnSaleOnly(checkboxChecked(e))}
-            details="With vendors selected, only their on-sale products match. With no vendors, all on-sale products match."
-          />
-          {onSaleOnly && (
+
+          {compareMode !== "off" && tagKey === normalize(DEFAULT_TAG) && (
             <s-banner tone="warning">
-              Discount Guard already excludes on-sale items automatically. Tagging
-              them &quot;{DEFAULT_TAG}&quot; keeps them excluded even after the sale
-              ends, until you remove the tag.
+              Discount Guard already excludes on-sale items automatically. If you tag
+              them &quot;{DEFAULT_TAG}&quot;, run Sync again after sales end so the
+              tag is removed from products that no longer have a compare-at price.
+            </s-banner>
+          )}
+        </s-stack>
+      </s-section>
+
+      <s-section heading="3. Scan all products">
+        <s-stack direction="block" gap="base">
+          <s-paragraph>
+            Checks every variant of every product in the store (active, draft and
+            archived). Rules above can be changed after scanning — results update
+            instantly.
+          </s-paragraph>
+          {scan && (
+            <s-banner tone={scan.running ? "info" : "success"}>
+              {scan.running
+                ? `Scanning… ${scan.variants} variants checked, ${catalogRef.current.size} products so far`
+                : `Scan complete: ${catalog?.length ?? 0} products, ${scan.variants} variants. ${hasTagCount} currently tagged "${tag}".`}
             </s-banner>
           )}
           <s-stack direction="inline" gap="base">
-            <s-button onClick={handleFind} {...(finding ? { loading: true } : {})}>
-              Find products
+            <s-button
+              onClick={startScan}
+              disabled={applying}
+              {...(scanning ? { loading: true } : {})}
+            >
+              {catalog ? "Rescan all products" : "Scan all products"}
             </s-button>
           </s-stack>
         </s-stack>
       </s-section>
 
-      {products && (
-        <s-section heading={`3. Matched products (${products.length})`}>
+      {catalog && (
+        <s-section heading="4. Review and apply">
           <s-stack direction="block" gap="base">
-            <s-paragraph>
-              {taggedCount} already tagged &quot;{tag}&quot;, {onSaleCount} on sale.
-            </s-paragraph>
+            {!hasRules && (
+              <s-banner tone="info">Choose a vendor or a compare-at price rule.</s-banner>
+            )}
+            <s-unordered-list>
+              <s-list-item>Matching products: {matching.length}</s-list-item>
+              <s-list-item>
+                Matching but missing the tag (will be added): {toAdd.length}
+              </s-list-item>
+              <s-list-item>
+                Tagged but not matching any rule (Sync removes the tag): {toRemove.length}
+              </s-list-item>
+            </s-unordered-list>
 
             {progress && (
-              <s-banner tone={applying ? "info" : progress.failures ? "warning" : "success"}>
-                {progress.mode === "add" ? "Adding" : "Removing"} tag: {progress.done} /{" "}
-                {progress.total} done
-                {progress.failures ? `, ${progress.failures} failed` : ""}
+              <s-banner
+                tone={progress.running ? "info" : progress.failures.length ? "warning" : "success"}
+                heading={`${progress.label}: ${progress.done} / ${progress.total} products`}
+              >
+                {progress.running
+                  ? "Working… keep this page open."
+                  : progress.failures.length
+                    ? `Finished with ${progress.failures.length} failures. First: ${progress.failures[0]}`
+                    : "Finished. Discount Guard updates eligible products automatically within about a minute."}
+              </s-banner>
+            )}
+
+            {confirmSync && (
+              <s-banner tone="critical" heading="Confirm sync">
+                <s-stack direction="block" gap="base">
+                  <s-paragraph>
+                    Add &quot;{tag}&quot; to {toAdd.length} products and REMOVE it from{" "}
+                    {toRemove.length} products that don&apos;t match the rules above —
+                    including any tagged by hand.
+                  </s-paragraph>
+                  <s-stack direction="inline" gap="base">
+                    <s-button tone="critical" variant="primary" onClick={handleSync}>
+                      Yes, sync now
+                    </s-button>
+                    <s-button onClick={() => setConfirmSync(false)}>Cancel</s-button>
+                  </s-stack>
+                </s-stack>
               </s-banner>
             )}
 
             <s-stack direction="inline" gap="base">
               <s-button
                 variant="primary"
-                onClick={() => handleApply("add")}
-                disabled={applying || products.length === taggedCount}
-                {...(applying && progress?.mode === "add" ? { loading: true } : {})}
+                onClick={handleAdd}
+                disabled={applying || scanning || toAdd.length === 0}
               >
-                Add tag to {products.length - taggedCount} products
+                Add tag to {toAdd.length} products
+              </s-button>
+              <s-button
+                onClick={() => setConfirmSync(true)}
+                disabled={
+                  applying || scanning || !hasRules || toAdd.length + toRemove.length === 0
+                }
+              >
+                Sync (add {toAdd.length}, remove {toRemove.length})
               </s-button>
               <s-button
                 tone="critical"
-                onClick={() => handleApply("remove")}
-                disabled={applying || taggedCount === 0}
-                {...(applying && progress?.mode === "remove" ? { loading: true } : {})}
+                onClick={handleRemoveFromMatching}
+                disabled={applying || scanning || matchingWithTag.length === 0}
               >
-                Remove tag from {taggedCount} products
+                Remove tag from {matchingWithTag.length} matching products
               </s-button>
             </s-stack>
 
-            {products.length > 0 && (
+            <s-select
+              label="Show"
+              value={view}
+              onChange={(e: Event) => setView(fieldValue(e) as PreviewView)}
+            >
+              <s-option value="matching">Matching products ({matching.length})</s-option>
+              <s-option value="toAdd">Will get the tag ({toAdd.length})</s-option>
+              <s-option value="toRemove">
+                Sync will remove the tag ({toRemove.length})
+              </s-option>
+            </s-select>
+
+            {previewRows.length > 0 ? (
               <s-table>
                 <s-table-header-row>
-                  <s-table-header>Product</s-table-header>
+                  <s-table-header listSlot="primary">Product</s-table-header>
                   <s-table-header>Vendor</s-table-header>
-                  <s-table-header>On sale</s-table-header>
+                  <s-table-header>Why</s-table-header>
+                  <s-table-header>Compare-at</s-table-header>
                   <s-table-header>Has tag</s-table-header>
                 </s-table-header-row>
                 <s-table-body>
-                  {products.slice(0, PREVIEW_ROWS).map((p) => (
+                  {previewRows.slice(0, PREVIEW_ROWS).map((p) => (
                     <s-table-row key={p.id}>
                       <s-table-cell>{p.title}</s-table-cell>
                       <s-table-cell>{p.vendor}</s-table-cell>
-                      <s-table-cell>{p.onSale ? "Yes" : "No"}</s-table-cell>
+                      <s-table-cell>{p.reason}</s-table-cell>
+                      <s-table-cell>
+                        {p.onSale ? "On sale" : p.hasCompareAt ? "Set" : "—"}
+                      </s-table-cell>
                       <s-table-cell>{p.hasTag ? "Yes" : "No"}</s-table-cell>
                     </s-table-row>
                   ))}
                 </s-table-body>
               </s-table>
+            ) : (
+              <s-paragraph>No products in this list.</s-paragraph>
             )}
-            {products.length > PREVIEW_ROWS && (
+            {previewRows.length > PREVIEW_ROWS && (
               <s-paragraph>
-                Showing first {PREVIEW_ROWS} of {products.length}. Actions apply to all{" "}
-                {products.length}.
+                Showing first {PREVIEW_ROWS} of {previewRows.length}. Actions apply to all
+                of them.
               </s-paragraph>
             )}
           </s-stack>

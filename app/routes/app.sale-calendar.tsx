@@ -184,6 +184,18 @@ const STATUS_TONE: Record<SaleStatus, "info" | "success" | "neutral" | "critical
   invalid: "critical",
 };
 
+const STATUS_ICON: Record<SaleStatus, "clock" | "live" | "check-circle" | "alert-triangle"> = {
+  upcoming: "clock",
+  live: "live",
+  ended: "check-circle",
+  invalid: "alert-triangle",
+};
+
+// Display order: what needs attention first.
+const STATUS_RANK: Record<SaleStatus, number> = { live: 0, invalid: 1, upcoming: 2, ended: 3 };
+
+type Filter = "all" | SaleStatus;
+
 function relative(iso: string, now: number) {
   const diff = new Date(iso).getTime() - now;
   const abs = Math.abs(diff);
@@ -194,12 +206,70 @@ function relative(iso: string, now: number) {
   return diff >= 0 ? `in ${text}` : `${text} ago`;
 }
 
+/** "Nov 13, 11:30 AM" (year only when it is not the current year). */
+function shortDate(iso: string | null, timeZone: string) {
+  if (!iso) return null;
+  const date = new Date(iso);
+  const sameYear =
+    new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric" }).format(date) ===
+    new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric" }).format(new Date());
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    month: "short",
+    day: "numeric",
+    ...(sameYear ? {} : { year: "numeric" }),
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
 const inputStyle = {
-  padding: "6px 8px",
-  border: "1px solid #8a8a8a",
+  width: "100%",
+  boxSizing: "border-box" as const,
+  padding: "8px 10px",
+  border: "1px solid var(--p-color-border, #8a8a8a)",
   borderRadius: "8px",
   font: "inherit",
 };
+
+type Overlay = HTMLElement & { showOverlay: () => void; hideOverlay: () => void };
+const overlay = (id: string) => document.getElementById(id) as Overlay | null;
+
+function StatTile({
+  label,
+  value,
+  tone,
+  icon,
+  active,
+  onClick,
+}: {
+  label: string;
+  value: number;
+  tone: "info" | "success" | "neutral" | "critical";
+  icon: "clock" | "live" | "check-circle" | "alert-triangle" | "calendar";
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <s-clickable onClick={onClick} borderRadius="base" accessibilityLabel={`Show ${label}`}>
+      <s-box
+        padding="base"
+        borderWidth="base"
+        borderRadius="base"
+        borderColor={active ? "strong" : "base"}
+        background={active ? "subdued" : "base"}
+      >
+        <s-stack direction="block" gap="small-200">
+          <s-stack direction="inline" gap="small-200" alignItems="center">
+            <s-icon type={icon} tone={tone} />
+            <s-text color="subdued">{label}</s-text>
+          </s-stack>
+          <s-heading>{value}</s-heading>
+        </s-stack>
+      </s-box>
+    </s-clickable>
+  );
+}
 
 export default function SaleCalendar() {
   const { timezone, settings, sales, logs } = useLoaderData<typeof loader>();
@@ -230,15 +300,20 @@ export default function SaleCalendar() {
     const data = mutate.data;
     if (mutate.state !== "idle" || !data || data === lastMutate.current) return;
     lastMutate.current = data;
-    if (data.error) shopify.toast.show(data.error, { isError: true });
-    else if (data.message) shopify.toast.show(data.message);
-    if (data.intent === "updateDates" && data.ok) setEditing(null);
-    if (data.intent === "save" && data.ok) {
+    if (data.error) {
+      shopify.toast.show(data.error, { isError: true });
+      return;
+    }
+    if (data.message) shopify.toast.show(data.message);
+    if (data.intent === "updateDates") overlay("edit-dates-modal")?.hideOverlay();
+    if (data.intent === "deleteSale") overlay("delete-modal")?.hideOverlay();
+    if (data.intent === "save") {
       setParsed(null);
       setCatalog(null);
     }
   }, [mutate.state, mutate.data, shopify]);
   const busy = mutate.state !== "idle";
+  const busyIntent = busy ? String(mutate.formData?.get("intent") ?? "") : "";
 
   const submit = (data: Record<string, string>) => mutate.submit(data, { method: "post" });
 
@@ -255,7 +330,6 @@ export default function SaleCalendar() {
   };
 
   // ---- Upload: parse sheet, then scan catalog and match names ----
-  const fileRef = useRef<HTMLInputElement>(null);
   const [parsed, setParsed] = useState<{ sales: ParsedSale[]; fileName: string } | null>(null);
   const [catalog, setCatalog] = useState<CatalogRow[] | null>(null);
   const [scanCount, setScanCount] = useState<number | null>(null);
@@ -263,10 +337,10 @@ export default function SaleCalendar() {
   const lastParse = useRef<ActionData | undefined>(undefined);
   const lastScan = useRef<ActionData | undefined>(undefined);
 
-  const readSheet = () => {
-    const file = fileRef.current?.files?.[0];
-    if (!file) {
-      shopify.toast.show("Choose an .xlsx file", { isError: true });
+  const readSheet = (file: File | undefined) => {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".xlsx")) {
+      shopify.toast.show("Upload an .xlsx file", { isError: true });
       return;
     }
     const form = new FormData();
@@ -345,47 +419,414 @@ export default function SaleCalendar() {
     submit({ intent: "save", sales: JSON.stringify(payload) });
   };
 
-  // ---- Edit dates ----
-  const [editing, setEditing] = useState<{ id: number; startsAt: string; endsAt: string } | null>(
-    null,
+  // ---- Sales list ----
+  const [filter, setFilter] = useState<Filter>("all");
+  const withStatus = useMemo(
+    () =>
+      sales
+        .map((s) => ({ ...s, status: saleStatus(s.startsAt, s.endsAt, new Date(now)) }))
+        .sort(
+          (a, b) =>
+            STATUS_RANK[a.status] - STATUS_RANK[b.status] ||
+            (a.status === "live"
+              ? new Date(a.endsAt!).getTime() - new Date(b.endsAt!).getTime()
+              : a.status === "ended"
+                ? new Date(b.endsAt!).getTime() - new Date(a.endsAt!).getTime()
+                : new Date(a.startsAt ?? 0).getTime() - new Date(b.startsAt ?? 0).getTime()),
+        ),
+    [sales, now],
   );
+  const counts = withStatus.reduce(
+    (acc, s) => ({ ...acc, [s.status]: acc[s.status] + 1 }),
+    { upcoming: 0, live: 0, ended: 0, invalid: 0 } as Record<SaleStatus, number>,
+  );
+  const visible = filter === "all" ? withStatus : withStatus.filter((s) => s.status === filter);
+  const liveProducts = new Set(
+    withStatus.filter((s) => s.status === "live").flatMap((s) => s.products.map((p) => p.id)),
+  ).size;
+
+  // ---- Modals ----
+  const [editing, setEditing] = useState<{
+    id: number;
+    name: string;
+    startsAt: string;
+    endsAt: string;
+  } | null>(null);
+  const [viewing, setViewing] = useState<(typeof sales)[number] | null>(null);
+  const [deleting, setDeleting] = useState<{ id: number; name: string } | null>(null);
+
+  const openEdit = (s: (typeof sales)[number]) => {
+    setEditing({
+      id: s.id,
+      name: s.name,
+      startsAt: toInputValue(s.startsAt, timezone),
+      endsAt: toInputValue(s.endsAt, timezone),
+    });
+    overlay("edit-dates-modal")?.showOverlay();
+  };
+
+  const editProblem = editing
+    ? dateProblem(
+        editing.startsAt ? new Date(editing.startsAt).toISOString() : null,
+        editing.endsAt ? new Date(editing.endsAt).toISOString() : null,
+      )
+    : null;
 
   const scanning = scanCount !== null;
   const reading = parseFetcher.state !== "idle";
-
-  const counts = sales.reduce(
-    (acc, s) => {
-      acc[saleStatus(s.startsAt, s.endsAt, new Date(now))] += 1;
-      return acc;
-    },
-    { upcoming: 0, live: 0, ended: 0, invalid: 0 } as Record<SaleStatus, number>,
-  );
+  const noCollection = !settings.collectionId;
+  const lastSyncFailed = settings.lastSyncMessage?.startsWith("Sync failed");
 
   return (
     <s-page heading="Sale Calendar">
       <s-link slot="breadcrumb-actions" href="/app">
         Home
       </s-link>
+      <s-button
+        slot="primary-action"
+        onClick={() => submit({ intent: "sync" })}
+        disabled={noCollection || (busy && busyIntent !== "sync")}
+        {...(busyIntent === "sync" ? { loading: true } : {})}
+      >
+        Sync now
+      </s-button>
 
-      <s-section heading="1. Collection">
-        <s-stack direction="block" gap="base">
-          <s-paragraph>
-            Products of a live sale are added to this collection, and removed after the
-            sale ends. Nothing else in the store is changed. Products you added to the
-            collection yourself always stay.
-          </s-paragraph>
-          <s-paragraph>
-            <s-text type="strong">Collection: </s-text>
-            {settings.collectionTitle ?? "None selected"}
-          </s-paragraph>
-          <s-stack direction="inline" gap="base">
-            <s-button onClick={chooseCollection} disabled={busy}>
-              {settings.collectionId ? "Change collection" : "Choose collection"}
-            </s-button>
+      {noCollection && (
+        <s-banner tone="warning" heading="Choose a collection to start">
+          <s-stack direction="block" gap="base">
+            <s-paragraph>
+              Sales are saved, but no products are added anywhere until you pick the
+              collection the sale products should appear in.
+            </s-paragraph>
+            <s-stack direction="inline" gap="base">
+              <s-button variant="primary" onClick={chooseCollection} disabled={busy}>
+                Choose collection
+              </s-button>
+            </s-stack>
           </s-stack>
-          <s-checkbox
-            label="Show products in sale order (first sale's products, then the next sale's)"
-            details="Sets the collection's sort to Manual and puts live sale products first, in sheet order."
+        </s-banner>
+      )}
+      {!noCollection && lastSyncFailed && (
+        <s-banner tone="critical" heading="Last sync failed">
+          {settings.lastSyncMessage}
+        </s-banner>
+      )}
+
+      {/* ---- Overview ---- */}
+      <s-section>
+        <s-grid gridTemplateColumns="repeat(auto-fit, minmax(150px, 1fr))" gap="base">
+          <StatTile
+            label="Live now"
+            value={counts.live}
+            tone="success"
+            icon="live"
+            active={filter === "live"}
+            onClick={() => setFilter(filter === "live" ? "all" : "live")}
+          />
+          <StatTile
+            label="Upcoming"
+            value={counts.upcoming}
+            tone="info"
+            icon="clock"
+            active={filter === "upcoming"}
+            onClick={() => setFilter(filter === "upcoming" ? "all" : "upcoming")}
+          />
+          <StatTile
+            label="Need dates"
+            value={counts.invalid}
+            tone="critical"
+            icon="alert-triangle"
+            active={filter === "invalid"}
+            onClick={() => setFilter(filter === "invalid" ? "all" : "invalid")}
+          />
+          <StatTile
+            label="Ended"
+            value={counts.ended}
+            tone="neutral"
+            icon="check-circle"
+            active={filter === "ended"}
+            onClick={() => setFilter(filter === "ended" ? "all" : "ended")}
+          />
+        </s-grid>
+      </s-section>
+
+      {/* ---- Sales ---- */}
+      <s-section heading={filter === "all" ? "Sales" : `Sales — ${STATUS_LABEL[filter]}`}>
+        <s-stack direction="block" gap="base">
+          {sales.length === 0 ? (
+            <s-box padding="large-200">
+              <s-stack direction="block" gap="small-200" alignItems="center">
+                <s-icon type="calendar" />
+                <s-heading>No sales yet</s-heading>
+                <s-text color="subdued">Upload the sale sheet below to get started.</s-text>
+              </s-stack>
+            </s-box>
+          ) : (
+            <>
+              <s-stack direction="inline" gap="small-200" alignItems="center">
+                <s-text color="subdued">
+                  {visible.length} of {sales.length} sales · {liveProducts} products in the
+                  collection now · times in {timezone}
+                </s-text>
+                {filter !== "all" && (
+                  <s-button variant="tertiary" onClick={() => setFilter("all")}>
+                    Show all
+                  </s-button>
+                )}
+              </s-stack>
+              <s-table>
+                <s-table-header-row>
+                  <s-table-header listSlot="primary">Sale</s-table-header>
+                  <s-table-header listSlot="secondary">Status</s-table-header>
+                  <s-table-header>Schedule</s-table-header>
+                  <s-table-header format="numeric">Products</s-table-header>
+                  <s-table-header>Actions</s-table-header>
+                </s-table-header-row>
+                <s-table-body>
+                  {visible.map((s) => {
+                    const when =
+                      s.status === "upcoming"
+                        ? `Starts ${relative(s.startsAt!, now)}`
+                        : s.status === "live"
+                          ? `Ends ${relative(s.endsAt!, now)}`
+                          : s.status === "ended"
+                            ? `Ended ${relative(s.endsAt!, now)}`
+                            : dateProblem(s.startsAt, s.endsAt);
+                    return (
+                      <s-table-row key={s.id}>
+                        <s-table-cell>
+                          <s-stack direction="block" gap="small-300">
+                            <s-text type="strong">{s.name}</s-text>
+                            {s.tab && <s-text color="subdued">Tab: {s.tab.trim()}</s-text>}
+                          </s-stack>
+                        </s-table-cell>
+                        <s-table-cell>
+                          <s-stack direction="block" gap="small-300">
+                            <s-badge tone={STATUS_TONE[s.status]} icon={STATUS_ICON[s.status]}>
+                              {STATUS_LABEL[s.status]}
+                            </s-badge>
+                            <s-text color="subdued">{when}</s-text>
+                          </s-stack>
+                        </s-table-cell>
+                        <s-table-cell>
+                          <s-stack direction="block" gap="small-300">
+                            <s-text>
+                              {shortDate(s.startsAt, timezone) ?? (
+                                <s-text tone="critical">No start date</s-text>
+                              )}
+                            </s-text>
+                            <s-text color="subdued">
+                              to{" "}
+                              {shortDate(s.endsAt, timezone) ?? (
+                                <s-text tone="critical">no end date</s-text>
+                              )}
+                            </s-text>
+                          </s-stack>
+                        </s-table-cell>
+                        <s-table-cell>
+                          <s-stack direction="block" gap="small-300">
+                            <s-text>{s.products.length}</s-text>
+                            {s.unmatched.length > 0 && (
+                              <s-text tone="critical">{s.unmatched.length} not found</s-text>
+                            )}
+                          </s-stack>
+                        </s-table-cell>
+                        <s-table-cell>
+                          <s-button-group gap="none">
+                            <s-button
+                              slot="secondary-actions"
+                              icon="calendar-time"
+                              disabled={busy}
+                              onClick={() => openEdit(s)}
+                            >
+                              Edit dates
+                            </s-button>
+                            <s-button
+                              slot="secondary-actions"
+                              icon="view"
+                              accessibilityLabel={`View products of ${s.name}`}
+                              onClick={() => {
+                                setViewing(s);
+                                overlay("products-modal")?.showOverlay();
+                              }}
+                            />
+                            <s-button
+                              slot="secondary-actions"
+                              icon="delete"
+                              tone="critical"
+                              accessibilityLabel={`Delete ${s.name}`}
+                              disabled={busy}
+                              onClick={() => {
+                                setDeleting({ id: s.id, name: s.name });
+                                overlay("delete-modal")?.showOverlay();
+                              }}
+                            />
+                          </s-button-group>
+                        </s-table-cell>
+                      </s-table-row>
+                    );
+                  })}
+                </s-table-body>
+              </s-table>
+              {visible.length === 0 && (
+                <s-text color="subdued">No sales with this status.</s-text>
+              )}
+            </>
+          )}
+        </s-stack>
+      </s-section>
+
+      {/* ---- Upload ---- */}
+      <s-section heading={sales.length ? "Replace sale sheet" : "Upload sale sheet"}>
+        <s-stack direction="block" gap="base">
+          <s-drop-zone
+            label="Sale sheet (.xlsx)"
+            accept=".xlsx"
+            accessibilityLabel="Upload sale sheet"
+            disabled={busy || scanning || reading}
+            onChange={(e: Event) =>
+              readSheet((e.currentTarget as unknown as { files: readonly File[] }).files?.[0])
+            }
+          />
+          <s-text color="subdued">
+            Needs a tab with Sale name, Start Date, End Date and a &quot;Products&quot; link
+            to each sale&apos;s tab. Dates are read in {timezone}. Saving replaces all
+            current sales.
+          </s-text>
+
+          {(reading || scanning) && (
+            <s-banner tone="info">
+              <s-stack direction="inline" gap="small-200" alignItems="center">
+                <s-spinner size="base" accessibilityLabel="Working" />
+                <s-text>
+                  {reading
+                    ? "Reading sheet…"
+                    : `Matching products with your store… ${scanCount} variants checked`}
+                </s-text>
+              </s-stack>
+            </s-banner>
+          )}
+
+          {preview && (
+            <s-box padding="base" borderWidth="base" borderRadius="base" background="subdued">
+              <s-stack direction="block" gap="base">
+                <s-stack direction="inline" gap="small-200" alignItems="center">
+                  <s-icon type="file" />
+                  <s-heading>Preview: {parsed?.fileName}</s-heading>
+                </s-stack>
+                <s-text>
+                  {preview.length} sales ·{" "}
+                  {preview.reduce((n, s) => n + s.products.length, 0)} products ·{" "}
+                  {preview.reduce((n, s) => n + s.unmatched.length, 0)} names not found ·{" "}
+                  {preview.filter((s) => s.problems.length).length} with date problems
+                </s-text>
+                <s-table>
+                  <s-table-header-row>
+                    <s-table-header listSlot="primary">Sale</s-table-header>
+                    <s-table-header>Schedule</s-table-header>
+                    <s-table-header format="numeric">Products</s-table-header>
+                    <s-table-header>Check</s-table-header>
+                  </s-table-header-row>
+                  <s-table-body>
+                    {preview.map((s, i) => {
+                      const issues = [
+                        ...s.problems,
+                        ...(s.unmatched.length ? [`${s.unmatched.length} names not found`] : []),
+                      ];
+                      return (
+                        <s-table-row key={i}>
+                          <s-table-cell>{s.name}</s-table-cell>
+                          <s-table-cell>
+                            {shortDate(s.startsAt, timezone) ?? "—"} →{" "}
+                            {shortDate(s.endsAt, timezone) ?? "—"}
+                          </s-table-cell>
+                          <s-table-cell>
+                            {s.products.length} ({s.matchedRows}/{s.items.length} rows)
+                          </s-table-cell>
+                          <s-table-cell>
+                            {issues.length ? (
+                              <s-badge tone="warning">{issues.join("; ")}</s-badge>
+                            ) : (
+                              <s-badge tone="success">OK</s-badge>
+                            )}
+                          </s-table-cell>
+                        </s-table-row>
+                      );
+                    })}
+                  </s-table-body>
+                </s-table>
+                {preview.some((s) => s.unmatched.length) && (
+                  <details>
+                    <summary>Show names not found in the store</summary>
+                    <ul>
+                      {preview.flatMap((s) =>
+                        s.unmatched.map((n, i) => (
+                          <li key={`${s.name}-${i}`}>
+                            {s.name}: {n}
+                          </li>
+                        )),
+                      )}
+                    </ul>
+                  </details>
+                )}
+                {preview.some((s) => s.problems.length) && (
+                  <s-text color="subdued">
+                    Sales with date problems are saved but never run until their dates are
+                    fixed with &quot;Edit dates&quot;.
+                  </s-text>
+                )}
+                <s-stack direction="inline" gap="base">
+                  <s-button
+                    variant="primary"
+                    onClick={saveSales}
+                    disabled={busy && busyIntent !== "save"}
+                    {...(busyIntent === "save" ? { loading: true } : {})}
+                  >
+                    Save {preview.length} sales
+                  </s-button>
+                  <s-button
+                    onClick={() => {
+                      setParsed(null);
+                      setCatalog(null);
+                    }}
+                  >
+                    Cancel
+                  </s-button>
+                </s-stack>
+              </s-stack>
+            </s-box>
+          )}
+        </s-stack>
+      </s-section>
+
+      {/* ---- Aside: collection ---- */}
+      <s-section slot="aside" heading="Collection">
+        <s-stack direction="block" gap="base">
+          {noCollection ? (
+            <s-badge tone="warning" icon="alert-triangle">
+              Not selected
+            </s-badge>
+          ) : (
+            <s-stack direction="inline" gap="small-200" alignItems="center">
+              <s-icon type="collection" />
+              <s-text type="strong">{settings.collectionTitle}</s-text>
+            </s-stack>
+          )}
+          <s-text color="subdued">
+            Live sale products are added here and removed after the sale ends. Products you
+            add to this collection yourself always stay.
+          </s-text>
+          <s-button
+            onClick={chooseCollection}
+            disabled={busy}
+            {...(noCollection ? { variant: "primary" as const } : {})}
+          >
+            {noCollection ? "Choose collection" : "Change collection"}
+          </s-button>
+          <s-divider />
+          <s-switch
+            label="Sale order"
+            details="Show the first sale's products first, then the next sale's. Sets the collection sort to Manual."
             checked={settings.reorder}
             disabled={busy}
             onChange={(e: Event) =>
@@ -398,258 +839,141 @@ export default function SaleCalendar() {
         </s-stack>
       </s-section>
 
-      <s-section heading="2. Upload sale sheet">
+      {/* ---- Aside: activity ---- */}
+      <s-section slot="aside" heading="Activity">
         <s-stack direction="block" gap="base">
-          <s-paragraph>
-            Upload the .xlsx with a &quot;Sale name / Start Date / End Date / Product Name
-            sheet&quot; tab. Each sale&apos;s &quot;Products&quot; link points to its products
-            tab. Dates are read in the store time zone ({timezone}). Saving replaces all
-            current sales.
-          </s-paragraph>
-          <input ref={fileRef} type="file" accept=".xlsx" />
-          <s-stack direction="inline" gap="base">
-            <s-button
-              onClick={readSheet}
-              disabled={busy || scanning}
-              {...(reading ? { loading: true } : {})}
-            >
-              Read sheet
-            </s-button>
+          <s-stack direction="inline" gap="small-200" alignItems="center">
+            <s-icon type="refresh" tone={lastSyncFailed ? "critical" : "success"} />
+            <s-text color="subdued">
+              Checks every 5 minutes.{" "}
+              {settings.lastSyncAt
+                ? `Last: ${shortDate(settings.lastSyncAt, timezone)}`
+                : "Not run yet."}
+            </s-text>
           </s-stack>
-          {scanning && (
-            <s-banner tone="info">
-              Matching products… {scanCount} store variants checked.
-            </s-banner>
-          )}
-
-          {preview && (
-            <s-stack direction="block" gap="base">
-              <s-heading>Preview: {parsed?.fileName}</s-heading>
-              <s-table>
-                <s-table-header-row>
-                  <s-table-header listSlot="primary">Sale</s-table-header>
-                  <s-table-header>Start</s-table-header>
-                  <s-table-header>End</s-table-header>
-                  <s-table-header>Products</s-table-header>
-                  <s-table-header>Problems</s-table-header>
-                </s-table-header-row>
-                <s-table-body>
-                  {preview.map((s, i) => (
-                    <s-table-row key={i}>
-                      <s-table-cell>{s.name}</s-table-cell>
-                      <s-table-cell>{formatInZone(s.startsAt, timezone)}</s-table-cell>
-                      <s-table-cell>{formatInZone(s.endsAt, timezone)}</s-table-cell>
-                      <s-table-cell>
-                        {s.products.length} products ({s.matchedRows}/{s.items.length} rows
-                        matched)
-                      </s-table-cell>
-                      <s-table-cell>
-                        {[
-                          ...s.problems,
-                          ...(s.unmatched.length ? [`${s.unmatched.length} names not found`] : []),
-                        ].join("; ") || "—"}
-                      </s-table-cell>
-                    </s-table-row>
-                  ))}
-                </s-table-body>
-              </s-table>
-              {preview.some((s) => s.unmatched.length) && (
-                <details>
-                  <summary>Names not found in the store</summary>
-                  <ul>
-                    {preview.flatMap((s) =>
-                      s.unmatched.map((n, i) => (
-                        <li key={`${s.name}-${i}`}>
-                          {s.name}: {n}
-                        </li>
-                      )),
-                    )}
-                  </ul>
-                </details>
-              )}
-              {preview.some((s) => s.problems.length) && (
-                <s-banner tone="warning">
-                  Sales with date problems are saved but never run until you fix their dates
-                  below.
-                </s-banner>
-              )}
-              <s-stack direction="inline" gap="base">
-                <s-button variant="primary" onClick={saveSales} disabled={busy}>
-                  Save {preview.length} sales
-                </s-button>
-                <s-button
-                  onClick={() => {
-                    setParsed(null);
-                    setCatalog(null);
-                  }}
-                >
-                  Cancel
-                </s-button>
-              </s-stack>
+          {logs.length === 0 ? (
+            <s-text color="subdued">No activity yet.</s-text>
+          ) : (
+            <s-stack direction="block" gap="small-200">
+              {logs.slice(0, 8).map((l) => (
+                <s-box key={l.id} paddingBlockEnd="small-200">
+                  <s-stack direction="block" gap="small-400">
+                    <s-text color="subdued">{shortDate(l.at, timezone)}</s-text>
+                    <s-text>{l.message}</s-text>
+                  </s-stack>
+                </s-box>
+              ))}
             </s-stack>
           )}
         </s-stack>
       </s-section>
 
-      <s-section heading="3. Sales">
-        <s-stack direction="block" gap="base">
-          <s-paragraph>
-            {sales.length
-              ? `${counts.live} live, ${counts.upcoming} upcoming, ${counts.ended} ended${counts.invalid ? `, ${counts.invalid} need dates` : ""}. Times in ${timezone}.`
-              : "No sales yet. Upload the sheet above."}
-          </s-paragraph>
-          {sales.length > 0 && (
-            <s-table>
-              <s-table-header-row>
-                <s-table-header listSlot="primary">Sale</s-table-header>
-                <s-table-header>Status</s-table-header>
-                <s-table-header>Start</s-table-header>
-                <s-table-header>End</s-table-header>
-                <s-table-header>Products</s-table-header>
-                <s-table-header>Actions</s-table-header>
-              </s-table-header-row>
-              <s-table-body>
-                {sales.map((s) => {
-                  const status = saleStatus(s.startsAt, s.endsAt, new Date(now));
-                  const isEditing = editing?.id === s.id;
-                  const when =
-                    status === "upcoming"
-                      ? `Starts ${relative(s.startsAt!, now)}`
-                      : status === "live"
-                        ? `Ends ${relative(s.endsAt!, now)}`
-                        : status === "ended"
-                          ? `Ended ${relative(s.endsAt!, now)}`
-                          : dateProblem(s.startsAt, s.endsAt);
-                  return (
-                    <s-table-row key={s.id}>
-                      <s-table-cell>{s.name}</s-table-cell>
-                      <s-table-cell>
-                        <s-stack direction="block" gap="small-200">
-                          <s-badge tone={STATUS_TONE[status]}>{STATUS_LABEL[status]}</s-badge>
-                          <s-text>{when}</s-text>
-                        </s-stack>
-                      </s-table-cell>
-                      <s-table-cell>
-                        {isEditing ? (
-                          <input
-                            type="datetime-local"
-                            style={inputStyle}
-                            value={editing.startsAt}
-                            onChange={(e) => setEditing({ ...editing, startsAt: e.target.value })}
-                          />
-                        ) : (
-                          formatInZone(s.startsAt, timezone)
-                        )}
-                      </s-table-cell>
-                      <s-table-cell>
-                        {isEditing ? (
-                          <input
-                            type="datetime-local"
-                            style={inputStyle}
-                            value={editing.endsAt}
-                            onChange={(e) => setEditing({ ...editing, endsAt: e.target.value })}
-                          />
-                        ) : (
-                          formatInZone(s.endsAt, timezone)
-                        )}
-                      </s-table-cell>
-                      <s-table-cell>
-                        {s.products.length}
-                        {s.unmatched.length ? ` (${s.unmatched.length} not found)` : ""}
-                      </s-table-cell>
-                      <s-table-cell>
-                        {isEditing ? (
-                          <s-stack direction="inline" gap="small-200">
-                            <s-button
-                              variant="primary"
-                              disabled={busy}
-                              onClick={() =>
-                                submit({
-                                  intent: "updateDates",
-                                  id: String(s.id),
-                                  startsAt: editing.startsAt,
-                                  endsAt: editing.endsAt,
-                                })
-                              }
-                            >
-                              Save
-                            </s-button>
-                            <s-button onClick={() => setEditing(null)}>Cancel</s-button>
-                          </s-stack>
-                        ) : (
-                          <s-stack direction="inline" gap="small-200">
-                            <s-button
-                              disabled={busy}
-                              onClick={() =>
-                                setEditing({
-                                  id: s.id,
-                                  startsAt: toInputValue(s.startsAt, timezone),
-                                  endsAt: toInputValue(s.endsAt, timezone),
-                                })
-                              }
-                            >
-                              Edit dates
-                            </s-button>
-                            <s-button
-                              tone="critical"
-                              variant="tertiary"
-                              disabled={busy}
-                              onClick={() => {
-                                if (confirm(`Delete "${s.name}"?`)) {
-                                  submit({ intent: "deleteSale", id: String(s.id) });
-                                }
-                              }}
-                            >
-                              Delete
-                            </s-button>
-                          </s-stack>
-                        )}
-                      </s-table-cell>
-                    </s-table-row>
-                  );
-                })}
-              </s-table-body>
-            </s-table>
-          )}
-        </s-stack>
-      </s-section>
-
-      <s-section heading="4. Sync">
-        <s-stack direction="block" gap="base">
-          <s-paragraph>
-            The app checks every 5 minutes and adds or removes products on time. Last
-            check:{" "}
-            {settings.lastSyncAt
-              ? `${formatInZone(settings.lastSyncAt, timezone)} — ${settings.lastSyncMessage ?? ""}`
-              : "never"}
-          </s-paragraph>
-          <s-stack direction="inline" gap="base">
-            <s-button
-              onClick={() => submit({ intent: "sync" })}
-              disabled={!settings.collectionId}
-              {...(busy ? { loading: true } : {})}
-            >
-              Sync now
-            </s-button>
+      {/* ---- Modals ---- */}
+      <s-modal id="edit-dates-modal" heading={editing ? `Edit dates — ${editing.name}` : "Edit dates"}>
+        {editing && (
+          <s-stack direction="block" gap="base">
+            <s-stack direction="block" gap="small-300">
+              <label htmlFor="sale-starts-at" style={{ fontWeight: 600 }}>
+                Start
+              </label>
+              <input
+                id="sale-starts-at"
+                type="datetime-local"
+                style={inputStyle}
+                value={editing.startsAt}
+                onChange={(e) => setEditing({ ...editing, startsAt: e.target.value })}
+              />
+            </s-stack>
+            <s-stack direction="block" gap="small-300">
+              <label htmlFor="sale-ends-at" style={{ fontWeight: 600 }}>
+                End
+              </label>
+              <input
+                id="sale-ends-at"
+                type="datetime-local"
+                style={inputStyle}
+                value={editing.endsAt}
+                onChange={(e) => setEditing({ ...editing, endsAt: e.target.value })}
+              />
+            </s-stack>
+            <s-text color="subdued">Times are in the store time zone ({timezone}).</s-text>
+            {editProblem && <s-text tone="critical">{editProblem}</s-text>}
           </s-stack>
-          {logs.length > 0 && (
-            <s-table>
-              <s-table-header-row>
-                <s-table-header>When</s-table-header>
-                <s-table-header listSlot="primary">What happened</s-table-header>
-              </s-table-header-row>
-              <s-table-body>
-                {logs.map((l) => (
-                  <s-table-row key={l.id}>
-                    <s-table-cell>{formatInZone(l.at, timezone)}</s-table-cell>
-                    <s-table-cell>{l.message}</s-table-cell>
-                  </s-table-row>
+        )}
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          disabled={!editing || !!editProblem || (busy && busyIntent !== "updateDates")}
+          {...(busyIntent === "updateDates" ? { loading: true } : {})}
+          onClick={() =>
+            editing &&
+            submit({
+              intent: "updateDates",
+              id: String(editing.id),
+              startsAt: editing.startsAt,
+              endsAt: editing.endsAt,
+            })
+          }
+        >
+          Save dates
+        </s-button>
+        <s-button slot="secondary-actions" commandFor="edit-dates-modal" command="--hide">
+          Cancel
+        </s-button>
+      </s-modal>
+
+      <s-modal id="products-modal" heading={viewing ? viewing.name : "Products"}>
+        {viewing && (
+          <s-stack direction="block" gap="base">
+            <s-text color="subdued">
+              {viewing.products.length} products, in the order they appear in the collection.
+            </s-text>
+            <s-scroll-box maxBlockSize="360px">
+              <s-ordered-list>
+                {viewing.products.map((p) => (
+                  <s-list-item key={p.id}>{p.title}</s-list-item>
                 ))}
-              </s-table-body>
-            </s-table>
-          )}
-        </s-stack>
-      </s-section>
+              </s-ordered-list>
+            </s-scroll-box>
+            {viewing.unmatched.length > 0 && (
+              <s-stack direction="block" gap="small-200">
+                <s-text tone="critical" type="strong">
+                  Not found in the store ({viewing.unmatched.length})
+                </s-text>
+                <s-unordered-list>
+                  {viewing.unmatched.map((n, i) => (
+                    <s-list-item key={i}>{n}</s-list-item>
+                  ))}
+                </s-unordered-list>
+              </s-stack>
+            )}
+          </s-stack>
+        )}
+        <s-button slot="secondary-actions" commandFor="products-modal" command="--hide">
+          Close
+        </s-button>
+      </s-modal>
+
+      <s-modal id="delete-modal" heading="Delete sale?">
+        <s-paragraph>
+          {deleting
+            ? `"${deleting.name}" will be removed. If it is live, its products leave the collection on the next sync.`
+            : ""}
+        </s-paragraph>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          tone="critical"
+          disabled={busy && busyIntent !== "deleteSale"}
+          {...(busyIntent === "deleteSale" ? { loading: true } : {})}
+          onClick={() => deleting && submit({ intent: "deleteSale", id: String(deleting.id) })}
+        >
+          Delete
+        </s-button>
+        <s-button slot="secondary-actions" commandFor="delete-modal" command="--hide">
+          Cancel
+        </s-button>
+      </s-modal>
     </s-page>
   );
 }

@@ -38,3 +38,35 @@ Create this merchant-editable product metafield in Shopify Admin:
 
 No vendor names are stored in or required by the app. To restrict any current or
 future vendor, set the metafield/tag on its products.
+
+## Sale Calendar
+
+Page: **Sale Calendar** in the app nav (`/app/sale-calendar`).
+
+1. Choose one collection. The app only works inside that collection.
+2. Upload the holiday sale `.xlsx`. The calendar tab needs `Sale name`,
+   `Start Date`, `End Date` and a `Product Name sheet` column whose
+   "Products" link points at the sale's products tab. Product tabs list names
+   like `Brand - Product - Variant` or `Brand - Product (Variant)`; an optional
+   `Product ID` column is used first when present.
+3. Review the preview (dates, matched products, problems) and save. Saving
+   replaces all sales.
+
+While a sale is live (start <= now < end, store time zone) its products are in
+the collection; after the end date they are removed. A background check runs
+every 5 minutes on the server, plus right after any change on the page.
+
+How it stays out of the way:
+
+- The app adds its own source, "Sale Calendar (managed by app)", inside the
+  chosen collection and only edits that source. The collection's own products
+  and rules are never touched. When no sale is live the source is deleted.
+- With "Show products in sale order" on, the collection sort is set to Manual
+  and live sale products are placed first, in sheet order.
+- Sales with a missing end date, or an end before the start, are saved but
+  never run until their dates are fixed on the page.
+- Collections hold whole products: a sheet row for one variant puts the whole
+  product in the collection.
+
+The server must stay running for sales to start and end on time, and the
+SQLite database must be on persistent storage so sales survive redeploys.

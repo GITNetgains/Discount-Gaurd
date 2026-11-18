@@ -32,3 +32,54 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
+
+// ---- Sale Calendar: scheduled products in one merchant-chosen collection ----
+
+model SaleSettings {
+  shop            String    @id
+  collectionId    String?
+  collectionTitle String?
+  // The app's own source inside the chosen collection (null when no sale is live).
+  sourceId        String?
+  timezone        String    @default("UTC")
+  reorder         Boolean   @default(true)
+  needsReorder    Boolean   @default(false)
+  lastSyncAt      DateTime?
+  lastSyncMessage String?
+}
+
+model Sale {
+  id        Int           @id @default(autoincrement())
+  shop      String
+  name      String
+  startsAt  DateTime?
+  endsAt    DateTime?
+  position  Int
+  sheetTab  String?
+  // JSON array of sheet product names that did not match a store product.
+  unmatched String        @default("[]")
+  createdAt DateTime      @default(now())
+  products  SaleProduct[]
+
+  @@index([shop])
+}
+
+model SaleProduct {
+  id        Int    @id @default(autoincrement())
+  saleId    Int
+  sale      Sale   @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  productId String
+  title     String
+  position  Int
+
+  @@index([saleId])
+}
+
+model SaleSyncLog {
+  id      Int      @id @default(autoincrement())
+  shop    String
+  at      DateTime @default(now())
+  message String
+
+  @@index([shop, at])
+}

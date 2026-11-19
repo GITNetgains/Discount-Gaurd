@@ -1,0 +1,14 @@
+{% doc %}
+  Adds live sale headings to the collection selected in Discount Guard.
+  @example
+  {% render 'discount-guard-sale-groups' %}
+{% enddoc %}
+{% if request.page_type == 'collection' and collection != blank %}
+  <script
+    src="https://jra.netgains.org/sale-collection-groups.js"
+    data-discount-guard-groups
+    data-shop="{{ shop.permanent_domain | escape }}"
+    data-collection="{{ collection.id }}"
+    defer
+  ></script>
+{% endif %}

@@ -1,4 +1,5 @@
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
+import { compareAtExcluded, type CompareAtRule } from "../lib/discount-eligibility";
 
 // Discount Guard works on every Shopify plan by keeping a hidden, app-managed
 // collection of eligible products and pointing a native Shopify discount code
@@ -6,8 +7,9 @@ import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
 //
 // A product is eligible only when:
 //   - it is NOT MAP restricted (`custom.map_restricted` = true OR tag "MAP Restricted"), and
-//   - NONE of its variants is on sale (compare-at price > price).
-// Collections work at product level, so a product with any on-sale variant is
+//   - NONE of its variants matches the configured compare-at exclusion rule.
+// The default rule excludes every non-empty compare-at price.
+// Collections work at product level, so a product with any compare-priced variant is
 // excluded entirely — this errs on the side of never over-discounting.
 
 export const ELIGIBLE_COLLECTION_HANDLE = "discount-guard-eligible";
@@ -63,11 +65,6 @@ function assertNoUserErrors(userErrors: { message: string }[] | undefined) {
   if (userErrors?.length) {
     throw new Error(userErrors.map((e) => e.message).join("; "));
   }
-}
-
-function isVariantOnSale(variant: VariantNode) {
-  if (!variant.compareAtPrice) return false;
-  return Number(variant.compareAtPrice) > Number(variant.price);
 }
 
 function isMapRestricted(product: VariantNode["product"]) {
@@ -186,24 +183,25 @@ export async function findEligibleCollection(
 
 export async function ensureEligibleCollection(
   admin: Pick<AdminApiContext, "graphql">,
+  rule: CompareAtRule = "any",
 ): Promise<EligibleCollection> {
   const existing = await findEligibleCollection(admin);
   if (existing) return { ...existing, created: false };
-  const { collection } = await createEligibleCollection(admin);
+  const { collection } = await createEligibleCollection(admin, rule);
   return { ...collection, created: true };
 }
 
 // Shopify rejects a conditions source with no selections, so the collection is
 // created already populated with the current eligible products.
-async function createEligibleCollection(admin: Pick<AdminApiContext, "graphql">) {
-  const eligibility = await evaluateProducts(admin);
+async function createEligibleCollection(admin: Pick<AdminApiContext, "graphql">, rule: CompareAtRule) {
+  const eligibility = await evaluateProducts(admin, undefined, rule);
   const eligibleIds = [...eligibility]
     .filter(([, eligible]) => eligible)
     .map(([productId]) => productId);
 
   if (eligibleIds.length === 0) {
     throw new Error(
-      "No eligible products found: every product is on sale or MAP Restricted.",
+      "No eligible products found: every product matches the compare-at exclusion rule or is MAP Restricted.",
     );
   }
 
@@ -284,6 +282,7 @@ async function updateSelections(
 async function evaluateProducts(
   admin: Pick<AdminApiContext, "graphql">,
   query?: string,
+  rule: CompareAtRule = "any",
 ) {
   const eligibility = new Map<string, boolean>();
   let cursor: string | null = null;
@@ -300,7 +299,7 @@ async function evaluateProducts(
       const productId = variant.product.id;
       const eligible =
         (eligibility.get(productId) ?? true) &&
-        !isVariantOnSale(variant) &&
+        !compareAtExcluded(variant, rule) &&
         !isMapRestricted(variant.product);
       eligibility.set(productId, eligible);
     }
@@ -343,10 +342,11 @@ async function currentMembers(
 /** Full catalog resync: recomputes eligibility for every product. */
 export async function syncAllProducts(
   admin: Pick<AdminApiContext, "graphql">,
+  rule: CompareAtRule = "any",
 ): Promise<SyncResult> {
   const collection = await findEligibleCollection(admin);
   if (!collection) {
-    const created = await createEligibleCollection(admin);
+    const created = await createEligibleCollection(admin, rule);
     return {
       eligible: created.eligibleCount,
       excluded: created.eligibility.size - created.eligibleCount,
@@ -356,7 +356,7 @@ export async function syncAllProducts(
   }
 
   const [eligibility, members] = await Promise.all([
-    evaluateProducts(admin),
+    evaluateProducts(admin, undefined, rule),
     currentMembers(admin, collection.collectionId),
   ]);
 
@@ -387,13 +387,14 @@ export async function syncAllProducts(
 export async function syncProduct(
   admin: Pick<AdminApiContext, "graphql">,
   productGid: string,
+  rule: CompareAtRule = "any",
 ) {
   const collection = await findEligibleCollection(admin);
   // Nothing to maintain until the merchant creates their first Discount Guard code.
   if (!collection) return;
 
   const numericId = productGid.split("/").pop();
-  const eligibility = await evaluateProducts(admin, `product_id:${numericId}`);
+  const eligibility = await evaluateProducts(admin, `product_id:${numericId}`, rule);
   const eligible = eligibility.get(productGid) ?? false;
 
   const data = await runGraphql<{

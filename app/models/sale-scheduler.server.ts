@@ -1,6 +1,7 @@
 import prisma from "../db.server";
 import { unauthenticated } from "../shopify.server";
 import { syncShop } from "./sale-calendar.server";
+import { syncDiscountProtection } from "./discount-protection.server";
 
 // Runs the Sale Calendar sync for every shop with a chosen collection, every
 // few minutes, so sales start and end on time without anyone opening the app.
@@ -24,6 +25,15 @@ async function runAll() {
       await syncShop(admin, shop);
     } catch (error) {
       console.error(`[sale-calendar] sync failed for ${shop}:`, error);
+    }
+  }
+  const discountSettings = await prisma.discountSettings.findMany();
+  for (const settings of discountSettings) {
+    try {
+      const { admin } = await unauthenticated.admin(settings.shop);
+      await syncDiscountProtection(admin, settings.shop, settings.compareAtRule === "off" ? "off" : "any");
+    } catch (error) {
+      console.error(`[discount-protection] sync failed for ${settings.shop}:`, error);
     }
   }
 }

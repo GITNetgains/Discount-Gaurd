@@ -164,7 +164,7 @@ export default function EditDiscount() {
             onChange={(e: Event) => setPercentage(fieldValue(e))}
           />
           <s-paragraph>
-            Sale-priced items (compare-at price greater than current price)
+            Products matching the compare-at rule in Settings
             and MAP Restricted products are automatically excluded — no
             configuration needed.
           </s-paragraph>

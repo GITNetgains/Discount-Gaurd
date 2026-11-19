@@ -1,0 +1,99 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Sale grouping browser checks</title></head><body>
+<style>.product-list--rows{width:800px}.product-block{float:left;width:25%;height:160px}.product-block:nth-child(4n+1){clear:both}</style>
+<main><div class="product-list--rows" data-infinite-scroll-results>
+  <article class="product-block" id="b"><a href="/products/b">B</a><button>Add B</button></article>
+  <article class="product-block" id="other"><a href="/products/other">Other</a></article>
+  <article class="product-block" id="a"><a href="/products/a">A</a></article>
+  <article class="product-block" id="sold"><a href="/products/sold">Sold out</a></article>
+</div></main>
+<pre id="result">RUNNING</pre>
+<script>
+  const grid = document.querySelector('[data-infinite-scroll-results]');
+  const originalMarkup = grid.innerHTML;
+  const unselected = location.search.includes('unselected');
+  const slow = location.search.includes('slow');
+  sessionStorage.clear();
+  let payload = unselected ? [] : [
+    { name: 'First <sale>', handles: ['a'] },
+    { name: 'Second', handles: ['b'] },
+  ];
+  let soldOut = ['sold'];
+  let refresh;
+  window.setInterval = (callback) => { refresh = callback; };
+  window.fetch = async (url) => {
+    if (slow && String(url).endsWith('.js')) await new Promise(resolve => setTimeout(resolve, 1200));
+    return { ok: true, json: async () => String(url).endsWith('.js')
+      ? { available: !String(url).includes('/sold.js') } : { groups: payload, soldOut: unselected ? [] : soldOut } };
+  };
+  let clicks = 0;
+  const button = document.querySelector('button');
+  button.addEventListener('click', () => clicks++);
+  const wait = () => new Promise((resolve) => setTimeout(resolve, 80));
+  const check = (condition, message) => { if (!condition) throw new Error(message); };
+  const sequence = () => Array.from(grid.children).filter((node) => !node.hasAttribute('data-dg-sale-hidden')).map((node) => node.id || node.textContent.trim());
+  window.addEventListener('load', async () => {
+    try {
+      await wait();
+      if (slow) {
+        check(!document.getElementById('a').hasAttribute('data-dg-sale-hidden'), 'Available product hidden while availability request pending');
+        check(grid.querySelectorAll('h2').length === 2, 'Headings delayed by availability requests');
+        await new Promise(resolve => setTimeout(resolve, 1400));
+      }
+      if (unselected) {
+        check(grid.innerHTML === originalMarkup, 'Other collection markup changed');
+        check(!grid.hasAttribute('data-dg-sale-active'), 'Other collection was styled');
+      } else {
+        check(JSON.stringify(sequence()) === JSON.stringify(['First <sale>', 'a', 'Second', 'b', 'other']), 'Wrong sale/product sequence');
+        check(grid.querySelectorAll('h2').length === 2, 'Missing or duplicate headings');
+        check(!grid.querySelector('sale'), 'Sale name was interpreted as HTML');
+        check(getComputedStyle(document.getElementById('sold')).display === 'none', 'Sold out product visible');
+        check(document.getElementById('other').getBoundingClientRect().top === document.getElementById('b').getBoundingClientRect().top, 'Theme float rules left a gap');
+        button.click();
+        check(clicks === 1 && button === document.querySelector('button'), 'Card handlers or identity changed');
+        const firstHeading = grid.querySelector('[data-dg-sale-heading]');
+        const card = document.getElementById('a');
+        const image = document.createElement('img');
+        image.dataset.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+        card.append(image);
+        let cardMoves = 0;
+        const movementObserver = new MutationObserver((records) => {
+          for (const record of records) {
+            for (const node of record.removedNodes) if (node === card || node.contains?.(card)) cardMoves++;
+          }
+        });
+        movementObserver.observe(grid, { childList: true, subtree: true });
+        image.append(document.createTextNode('lazyload update'));
+        await wait();
+        await refresh();
+        await wait();
+        movementObserver.disconnect();
+        check(cardMoves === 0, 'Image updates or unchanged refresh detached a product card');
+        check(firstHeading === grid.querySelector('[data-dg-sale-heading]'), 'Unchanged refresh recreated headings');
+        check(image === card.querySelector('img'), 'Image identity changed');
+        check(image.getAttribute('src') === image.dataset.src && image.complete && image.naturalWidth > 0, 'Lazy image did not load after grouping');
+        let imageChanges = 0;
+        const imageObserver = new MutationObserver(records => { imageChanges += records.length; });
+        imageObserver.observe(image, { attributes: true, attributeFilter: ['src', 'srcset'] });
+        window.dispatchEvent(new Event('resize'));
+        await refresh();
+        await wait();
+        imageObserver.disconnect();
+        check(imageChanges === 0, 'Refresh or resize rewrote an already loaded image');
+        grid.append(document.getElementById('a'));
+        await wait();
+        check(sequence()[1] === 'a' && grid.querySelectorAll('h2').length === 2, 'AJAX mutation broke grouping');
+        payload = [];
+        soldOut = [];
+        await refresh();
+        check(JSON.stringify(sequence()) === JSON.stringify(['b', 'other', 'a', 'sold']), 'Ended sale did not restore original card order');
+        check(!grid.querySelector('h2') && !grid.hasAttribute('data-dg-sale-active'), 'Ended sale left headings or styling');
+      }
+      document.getElementById('result').textContent = 'PASS ' + (unselected ? 'unselected collection unchanged' : 'group order, escaping, native card handlers, AJAX, sale expiry');
+    } catch (error) {
+      document.getElementById('result').textContent = 'FAIL ' + error.message;
+    }
+  });
+</script>
+<script src="../public/sale-collection-groups.js" data-discount-guard-groups data-shop="test.myshopify.com" data-collection="123" defer></script>
+</body></html>

@@ -4,6 +4,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { createCodeDiscount } from "../models/discounts.server";
+import { getDiscountSettings } from "../models/discount-settings.server";
 
 function fieldValue(event: Event) {
   return (event.target as HTMLInputElement).value;
@@ -19,11 +20,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const payload = JSON.parse(String(formData.get("discount")));
 
   try {
+    const settings = await getDiscountSettings(session.shop);
     const result = await createCodeDiscount(admin, {
       title: payload.title,
       code: payload.code,
@@ -33,7 +35,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       usageLimit: payload.usageLimit ? Number(payload.usageLimit) : null,
       appliesOncePerCustomer: Boolean(payload.appliesOncePerCustomer),
       combinesWith: payload.combinesWith,
-    });
+    }, settings.compareAtRule);
 
     if (result.userErrors.length > 0) {
       return { errors: result.userErrors };
@@ -149,7 +151,7 @@ export default function NewDiscount() {
             onChange={(e: Event) => setPercentage(fieldValue(e))}
           />
           <s-paragraph>
-            Sale-priced items (compare-at price greater than current price)
+            Products matching the compare-at rule in Settings
             and MAP Restricted products are automatically excluded — no
             configuration needed. The first code you create may take a moment
             while the app builds the eligible-products list.

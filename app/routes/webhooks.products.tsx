@@ -1,6 +1,8 @@
 import type { ActionFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
 import { syncProduct } from "../models/eligibility.server";
+import { getDiscountSettings } from "../models/discount-settings.server";
+import { scheduleDiscountProtection } from "../models/discount-protection.server";
 
 // Keeps the Discount Guard eligible-products collection current when a product's
 // price, compare-at price, tags, or MAP metafield change.
@@ -13,7 +15,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   if (admin && productGid) {
     try {
-      await syncProduct(admin, productGid);
+      const settings = await getDiscountSettings(shop);
+      await syncProduct(admin, productGid, settings.compareAtRule);
+      scheduleDiscountProtection(admin, shop, settings.compareAtRule);
     } catch (error) {
       console.error(`Discount Guard sync failed for ${productGid}`, error);
       // Non-2xx makes Shopify retry the delivery.

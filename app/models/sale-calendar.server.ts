@@ -1,5 +1,6 @@
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
 import prisma from "../db.server";
+import { newestSaleFirst } from "../lib/storefront-sale-groups";
 import { readWorkbook, type SheetCell } from "./xlsx.server";
 import {
   dateProblem,
@@ -421,8 +422,8 @@ async function desiredProducts(shop: string, now: Date) {
         saleStatus(s.startsAt?.toISOString() ?? null, s.endsAt?.toISOString() ?? null, now) ===
         "live",
     )
-    // "First sale's products, then the next sale's": sheet order.
-    .sort((a, b) => a.position - b.position);
+    // Keep collection pagination in the same newest-first order as sale headings.
+    .sort(newestSaleFirst);
   const ordered: string[] = [];
   const seen = new Set<string>();
   for (const sale of live) {

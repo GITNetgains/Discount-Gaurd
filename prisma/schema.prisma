@@ -35,6 +35,22 @@ model Session {
 
 // ---- Sale Calendar: scheduled products in one merchant-chosen collection ----
 
+model DiscountSettings {
+  shop          String    @id
+  compareAtRule String    @default("any")
+  syncedRule    String?
+  lastSyncAt    DateTime?
+  lastSyncError String?
+}
+
+model DiscountCollectionMirror {
+  shop                 String
+  originalCollectionId String
+  protectedCollectionId String
+  @@id([shop, originalCollectionId])
+  @@unique([shop, protectedCollectionId])
+}
+
 model SaleSettings {
   shop            String    @id
   collectionId    String?

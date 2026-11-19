@@ -20,13 +20,31 @@ lose their target; create/resync from the app to rebuild, then recreate codes.
 
 A product is excluded when **any** of these is true:
 
-- Sale: any variant has compare-at price greater than its price.
+- Compare-at price: any variant has a compare-at price set, regardless of whether
+  it is greater than, equal to, or less than the current price, when the Settings
+  protection switch is ON (the default). OFF removes only this restriction.
 - MAP: product metafield `custom.map_restricted` is `true`.
 - MAP: product has the tag `MAP Restricted` (case-insensitive).
 
-Collections work per product, so a product with even one on-sale variant is
+Collections work per product, so a product with even one compare-priced variant is
 excluded entirely (safer than the old per-line function, which only skipped the
 on-sale variant).
+
+## Protection settings
+
+`/app/settings` provides the compare-at ON/OFF switch. Save & resync updates the
+eligible collection for existing codes; product webhooks use the saved shop rule.
+Normal-price products stay eligible, subject to the existing MAP restrictions.
+Existing native amount-off product discounts scoped to collections use unpublished
+protected copies of their original collections when ON. These copies exclude only
+compare-at products, retain the original selection, and keep discount values and
+conditions unchanged. OFF restores original collection targets. Original storefront
+collections remain unchanged. Product webhooks and a five-minute sync maintain the
+copies and check new native collection-based discounts.
+The coverage review lists active discounts and identifies protected scopes.
+Third-party app discounts and unsupported target types need separate exclusions.
+Shopify has no global per-product exclusion switch for every discount; order-wide
+discounts and other apps require changes in the discount that grants the savings.
 
 ## MAP Restricted product control
 
@@ -62,7 +80,8 @@ How it stays out of the way:
   chosen collection and only edits that source. The collection's own products
   and rules are never touched. When no sale is live the source is deleted.
 - With "Show products in sale order" on, the collection sort is set to Manual
-  and live sale products are placed first, in sheet order.
+  and live sale products are placed first, with the most recently started sale
+  first. Equal start times use sheet order; products within a sale keep sheet order.
 - Sales with a missing end date, or an end before the start, are saved but
   never run until their dates are fixed on the page.
 - Collections hold whole products: a sheet row for one variant puts the whole

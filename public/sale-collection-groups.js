@@ -77,7 +77,7 @@
     }
   }
 
-  /** "Nov 13 – Nov 20, 2026" in the store's time zone. */
+  /** "Sale starts: Nov 13, 2026 · Sale ends: Nov 20, 2026" in the store time zone. */
   function saleDates(group) {
     const start = new Date(group.startsAt);
     let end = new Date(group.endsAt);
@@ -88,10 +88,7 @@
       const part = (type) => Number(parts.find((p) => p.type === type)?.value);
       if (part('hour') % 24 === 0 && part('minute') === 0 && end - start > 60_000) end = new Date(end.getTime() - 60_000);
     } catch { /* Keep the exact end date. */ }
-    const sameYear = yearOf(start) === yearOf(end);
-    const from = formatDate(start, !sameYear);
-    const to = formatDate(end, true);
-    return from === formatDate(end, !sameYear) ? to : `${from} – ${to}`;
+    return `Sale starts: ${formatDate(start, true)}  ·  Sale ends: ${formatDate(end, true)}`;
   }
 
   function handleOf(card) {

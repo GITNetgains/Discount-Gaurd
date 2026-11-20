@@ -28,6 +28,8 @@ export function liveSaleGroups(sales: StorefrontSale[], now = new Date()) {
     .sort(newestSaleFirst)
     .map((sale) => ({
       name: sale.name,
+      startsAt: sale.startsAt!.toISOString(),
+      endsAt: sale.endsAt!.toISOString(),
       productIds: [...sale.products]
         .sort((a, b) => a.position - b.position)
         .map((product) => product.productId)

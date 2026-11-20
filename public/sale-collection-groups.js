@@ -9,11 +9,12 @@
   const main = document.querySelector('main') || document.body;
   let groups = [];
   let soldOut = new Set();
+  let timezone;
   let observer;
   let scheduled = false;
   const originals = new WeakMap();
   const nativeDisplay = new WeakMap();
-  const cacheKey = `discount-guard:v2:${endpoint.href}`;
+  const cacheKey = `discount-guard:v3:${endpoint.href}`;
   function readCache() {
     try {
       const entry = JSON.parse(sessionStorage.getItem(cacheKey));
@@ -57,6 +58,40 @@
       if (src) image.src = src.replace(/\{width\}/g, String(Math.ceil(card.getBoundingClientRect().width * (window.devicePixelRatio || 1)) || 800));
       image.loading = 'lazy';
     }
+  }
+
+  function formatDate(date, withYear) {
+    const options = { month: 'short', day: 'numeric', ...(withYear ? { year: 'numeric' } : {}) };
+    try {
+      return new Intl.DateTimeFormat('en-US', { ...options, timeZone: timezone }).format(date);
+    } catch {
+      return new Intl.DateTimeFormat('en-US', options).format(date);
+    }
+  }
+
+  function yearOf(date) {
+    try {
+      return new Intl.DateTimeFormat('en-US', { year: 'numeric', timeZone: timezone }).format(date);
+    } catch {
+      return String(date.getFullYear());
+    }
+  }
+
+  /** "Nov 13 – Nov 20, 2026" in the store's time zone. */
+  function saleDates(group) {
+    const start = new Date(group.startsAt);
+    let end = new Date(group.endsAt);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return '';
+    // A sale ending exactly at midnight runs through the previous day.
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: 'numeric', hourCycle: 'h23', timeZone: timezone }).formatToParts(end);
+      const part = (type) => Number(parts.find((p) => p.type === type)?.value);
+      if (part('hour') % 24 === 0 && part('minute') === 0 && end - start > 60_000) end = new Date(end.getTime() - 60_000);
+    } catch { /* Keep the exact end date. */ }
+    const sameYear = yearOf(start) === yearOf(end);
+    const from = formatDate(start, !sameYear);
+    const to = formatDate(end, true);
+    return from === formatDate(end, !sameYear) ? to : `${from} – ${to}`;
   }
 
   function handleOf(card) {
@@ -120,6 +155,17 @@
         if (heading.textContent !== group.name) heading.textContent = group.name;
         heading.style.cssText = 'margin:0;text-align:left;';
         if (!heading.parentNode) wrapper.append(heading);
+        const datesText = saleDates(group);
+        let dates = wrapper.querySelector('[data-dg-sale-dates]');
+        if (datesText) {
+          if (!dates) {
+            dates = document.createElement('p');
+            dates.dataset.dgSaleDates = '';
+          }
+          if (dates.textContent !== datesText) dates.textContent = datesText;
+          dates.style.cssText = 'margin:0.35rem 0 0;text-align:left;font-size:0.95em;opacity:0.75;letter-spacing:0.01em;';
+          if (dates.previousElementSibling !== heading) heading.after(dates);
+        } else dates?.remove();
         desired.push(wrapper);
         for (const card of matched) {
           remaining.delete(card);
@@ -142,6 +188,7 @@
   function use(data) {
     groups = Array.isArray(data?.groups) ? data.groups : [];
     soldOut = new Set(Array.isArray(data?.soldOut) ? data.soldOut : []);
+    timezone = typeof data?.timezone === 'string' ? data.timezone : undefined;
   }
 
   async function refresh() {
@@ -151,7 +198,7 @@
       const result = await response.json();
       if (!Array.isArray(result.groups)) return;
       use(result);
-      writeCache({ groups, soldOut: [...soldOut] });
+      writeCache({ groups, soldOut: [...soldOut], timezone });
       if (!active() && !observer) return;
       if (!observer) {
         observer = new MutationObserver((records) => {

@@ -35,8 +35,8 @@ const VARIANT_AVAILABILITY = `#graphql
   }
 `;
 
-type Groups = { name: string; handles: string[] }[];
-export type StorefrontSaleData = { groups: Groups; soldOut: string[] };
+type Groups = { name: string; startsAt: string; endsAt: string; handles: string[] }[];
+export type StorefrontSaleData = { groups: Groups; soldOut: string[]; timezone?: string };
 type Admin = Awaited<ReturnType<typeof unauthenticated.admin>>["admin"];
 
 const cache = new Map<string, { expires: number; value: Promise<unknown> }>();
@@ -70,6 +70,8 @@ async function saleHandles(admin: Admin, groups: ReturnType<typeof liveSaleGroup
   }
   return groups.map((group) => ({
     name: group.name,
+    startsAt: group.startsAt,
+    endsAt: group.endsAt,
     handles: group.productIds.flatMap((id) => handles.has(id) ? [handles.get(id)!] : []),
   })).filter((group) => group.handles.length);
 }
@@ -120,5 +122,5 @@ export async function storefrontSaleGroups(shop: string, collectionId: string): 
       : Promise.resolve([]),
     cached(JSON.stringify(["stock", shop, collectionId]), 60_000, () => soldOutHandles(admin, collectionGid)),
   ]);
-  return { groups, soldOut };
+  return { groups, soldOut, timezone: settings.timezone };
 }

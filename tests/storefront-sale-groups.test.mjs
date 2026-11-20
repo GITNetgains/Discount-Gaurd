@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { liveSaleGroups } from '../app/lib/storefront-sale-groups.ts';
+import { liveSaleGroups as rawLiveSaleGroups } from '../app/lib/storefront-sale-groups.ts';
+
+const liveSaleGroups = (...args) =>
+  rawLiveSaleGroups(...args).map(({ name, productIds }) => ({ name, productIds }));
+
+test('includes each live sale start and end time', () => {
+  const [group] = rawLiveSaleGroups([sale('Dated', 0, ['a'])], now);
+  assert.equal(group.startsAt, '2026-11-18T09:00:00.000Z');
+  assert.equal(group.endsAt, '2026-11-18T11:00:00.000Z');
+});
 
 const now = new Date('2026-11-18T10:00:00Z');
 const sale = (name, position, ids, overrides = {}) => ({

@@ -130,13 +130,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const endsAt = toDate(formData.get("endsAt"));
       const problem = dateProblem(startsAt?.toISOString() ?? null, endsAt?.toISOString() ?? null);
       if (problem) return { intent, error: problem };
+      const name = String(formData.get("name") ?? "").replace(/\s+/g, " ").trim();
+      if (!name) return { intent, error: "Enter a sale name." };
+      if (name.length > 120) return { intent, error: "Sale name is too long (max 120 characters)." };
       const sale = await prisma.sale.findFirst({ where: { id, shop } });
       if (!sale) return { intent, error: "Sale not found." };
-      await prisma.sale.update({ where: { id }, data: { startsAt, endsAt } });
-      await log(
-        shop,
-        `Dates changed for "${sale.name}": ${formatInZone(startsAt!.toISOString(), timezone)} – ${formatInZone(endsAt!.toISOString(), timezone)}.`,
-      );
+      await prisma.sale.update({ where: { id }, data: { name, startsAt, endsAt } });
+      if (name !== sale.name) await log(shop, `Renamed sale "${sale.name}" to "${name}".`);
+      const datesChanged =
+        sale.startsAt?.getTime() !== startsAt?.getTime() || sale.endsAt?.getTime() !== endsAt?.getTime();
+      if (datesChanged) {
+        await log(
+          shop,
+          `Dates changed for "${name}": ${formatInZone(startsAt!.toISOString(), timezone)} – ${formatInZone(endsAt!.toISOString(), timezone)}.`,
+        );
+      }
       return { intent, ok: true, message: await syncAfterChange(admin, shop) };
     }
 
@@ -471,6 +479,7 @@ export default function SaleCalendar() {
         editing.endsAt ? new Date(editing.endsAt).toISOString() : null,
       )
     : null;
+  const nameProblem = editing && !editing.name.trim() ? "Enter a sale name." : null;
 
   const scanning = scanCount !== null;
   const reading = parseFetcher.state !== "idle";
@@ -639,7 +648,7 @@ export default function SaleCalendar() {
                               disabled={busy}
                               onClick={() => openEdit(s)}
                             >
-                              Edit dates
+                              Edit
                             </s-button>
                             <s-button
                               slot="secondary-actions"
@@ -772,7 +781,7 @@ export default function SaleCalendar() {
                 {preview.some((s) => s.problems.length) && (
                   <s-text color="subdued">
                     Sales with date problems are saved but never run until their dates are
-                    fixed with &quot;Edit dates&quot;.
+                    fixed with &quot;Edit&quot;.
                   </s-text>
                 )}
                 <s-stack direction="inline" gap="base">
@@ -869,9 +878,23 @@ export default function SaleCalendar() {
       </s-section>
 
       {/* ---- Modals ---- */}
-      <s-modal id="edit-dates-modal" heading={editing ? `Edit dates — ${editing.name}` : "Edit dates"}>
+      <s-modal id="edit-dates-modal" heading="Edit sale">
         {editing && (
           <s-stack direction="block" gap="base">
+            <s-stack direction="block" gap="small-300">
+              <label htmlFor="sale-name" style={{ fontWeight: 600 }}>
+                Sale name
+              </label>
+              <input
+                id="sale-name"
+                type="text"
+                maxLength={120}
+                style={inputStyle}
+                value={editing.name}
+                onChange={(e) => setEditing({ ...editing, name: e.target.value })}
+              />
+              <s-text color="subdued">Shown as the heading above this sale&apos;s products in the store.</s-text>
+            </s-stack>
             <s-stack direction="block" gap="small-300">
               <label htmlFor="sale-starts-at" style={{ fontWeight: 600 }}>
                 Start
@@ -897,25 +920,28 @@ export default function SaleCalendar() {
               />
             </s-stack>
             <s-text color="subdued">Times are in the store time zone ({timezone}).</s-text>
-            {editProblem && <s-text tone="critical">{editProblem}</s-text>}
+            {(nameProblem || editProblem) && (
+              <s-text tone="critical">{nameProblem || editProblem}</s-text>
+            )}
           </s-stack>
         )}
         <s-button
           slot="primary-action"
           variant="primary"
-          disabled={!editing || !!editProblem || (busy && busyIntent !== "updateDates")}
+          disabled={!editing || !!editProblem || !!nameProblem || (busy && busyIntent !== "updateDates")}
           {...(busyIntent === "updateDates" ? { loading: true } : {})}
           onClick={() =>
             editing &&
             submit({
               intent: "updateDates",
               id: String(editing.id),
+              name: editing.name,
               startsAt: editing.startsAt,
               endsAt: editing.endsAt,
             })
           }
         >
-          Save dates
+          Save
         </s-button>
         <s-button slot="secondary-actions" commandFor="edit-dates-modal" command="--hide">
           Cancel

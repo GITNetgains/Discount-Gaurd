@@ -77,7 +77,7 @@
     }
   }
 
-  /** "Sale starts: Nov 13, 2026 · Sale ends: Nov 20, 2026" in the store time zone. */
+  /** "Duration : Nov 19, 2026   to  Dec 5, 2026" in the store time zone. */
   function saleDates(group) {
     const start = new Date(group.startsAt);
     let end = new Date(group.endsAt);
@@ -88,7 +88,7 @@
       const part = (type) => Number(parts.find((p) => p.type === type)?.value);
       if (part('hour') % 24 === 0 && part('minute') === 0 && end - start > 60_000) end = new Date(end.getTime() - 60_000);
     } catch { /* Keep the exact end date. */ }
-    return `Sale starts: ${formatDate(start, true)}  ·  Sale ends: ${formatDate(end, true)}`;
+    return `Duration : ${formatDate(start, true)}   to  ${formatDate(end, true)}`;
   }
 
   function handleOf(card) {
@@ -160,7 +160,7 @@
             dates.dataset.dgSaleDates = '';
           }
           if (dates.textContent !== datesText) dates.textContent = datesText;
-          dates.style.cssText = 'margin:0.35rem 0 0;text-align:left;font-size:0.95em;opacity:0.75;letter-spacing:0.01em;';
+          dates.style.cssText = 'margin:0.35rem 0 0;text-align:left;font-size:0.95em;opacity:0.75;letter-spacing:0.01em;white-space:pre-wrap;';
           if (dates.previousElementSibling !== heading) heading.after(dates);
         } else dates?.remove();
         desired.push(wrapper);

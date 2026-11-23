@@ -119,8 +119,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return { intent, ok: true, message: await syncAfterChange(admin, shop) };
     }
 
-    if (intent === "updateDates") {
-      const id = Number(formData.get("id"));
+    if (intent === "saveSale") {
+      // Creates a sale (no id) or updates one: name, dates and its ordered products.
+      const rawId = String(formData.get("id") ?? "");
+      const id = rawId ? Number(rawId) : null;
       const timezone = (await getSettings(shop)).timezone;
       const toDate = (value: FormDataEntryValue | null) => {
         const wall = parseSheetDate(String(value ?? ""));
@@ -133,18 +135,57 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const name = String(formData.get("name") ?? "").replace(/\s+/g, " ").trim();
       if (!name) return { intent, error: "Enter a sale name." };
       if (name.length > 120) return { intent, error: "Sale name is too long (max 120 characters)." };
-      const sale = await prisma.sale.findFirst({ where: { id, shop } });
+
+      const rawProducts: unknown = JSON.parse(String(formData.get("products") ?? "[]"));
+      if (!Array.isArray(rawProducts)) return { intent, error: "Invalid product list." };
+      const seen = new Set<string>();
+      const products = rawProducts
+        .map((p) => ({ id: String(p?.id ?? ""), title: String(p?.title ?? "").slice(0, 255) }))
+        .filter((p) => /^gid:\/\/shopify\/Product\/\d+$/.test(p.id) && !seen.has(p.id) && seen.add(p.id));
+      if (!products.length) return { intent, error: "Add at least one product." };
+      const productRows = products.map((p, i) => ({ productId: p.id, title: p.title, position: i }));
+      const range = `${formatInZone(startsAt!.toISOString(), timezone)} – ${formatInZone(endsAt!.toISOString(), timezone)}`;
+
+      if (id === null) {
+        const last = await prisma.sale.findFirst({ where: { shop }, orderBy: { position: "desc" } });
+        await prisma.sale.create({
+          data: {
+            shop,
+            name,
+            startsAt,
+            endsAt,
+            position: (last?.position ?? -1) + 1,
+            products: { create: productRows },
+          },
+        });
+        await log(shop, `Added sale "${name}" (${products.length} products): ${range}.`);
+        return { intent, ok: true, message: await syncAfterChange(admin, shop) };
+      }
+
+      const sale = await prisma.sale.findFirst({
+        where: { id, shop },
+        include: { products: { orderBy: { position: "asc" } } },
+      });
       if (!sale) return { intent, error: "Sale not found." };
-      await prisma.sale.update({ where: { id }, data: { name, startsAt, endsAt } });
+      const productsChanged =
+        sale.products.map((p) => p.productId).join() !== products.map((p) => p.id).join();
+      await prisma.$transaction([
+        prisma.sale.update({ where: { id: sale.id }, data: { name, startsAt, endsAt } }),
+        ...(productsChanged
+          ? [
+              prisma.saleProduct.deleteMany({ where: { saleId: sale.id } }),
+              prisma.sale.update({
+                where: { id: sale.id },
+                data: { products: { create: productRows } },
+              }),
+            ]
+          : []),
+      ]);
       if (name !== sale.name) await log(shop, `Renamed sale "${sale.name}" to "${name}".`);
       const datesChanged =
         sale.startsAt?.getTime() !== startsAt?.getTime() || sale.endsAt?.getTime() !== endsAt?.getTime();
-      if (datesChanged) {
-        await log(
-          shop,
-          `Dates changed for "${name}": ${formatInZone(startsAt!.toISOString(), timezone)} – ${formatInZone(endsAt!.toISOString(), timezone)}.`,
-        );
-      }
+      if (datesChanged) await log(shop, `Dates changed for "${name}": ${range}.`);
+      if (productsChanged) await log(shop, `Products updated for "${name}" (${products.length} products).`);
       return { intent, ok: true, message: await syncAfterChange(admin, shop) };
     }
 
@@ -313,7 +354,7 @@ export default function SaleCalendar() {
       return;
     }
     if (data.message) shopify.toast.show(data.message);
-    if (data.intent === "updateDates") overlay("edit-dates-modal")?.hideOverlay();
+    if (data.intent === "saveSale") overlay("sale-modal")?.hideOverlay();
     if (data.intent === "deleteSale") overlay("delete-modal")?.hideOverlay();
     if (data.intent === "save") {
       setParsed(null);
@@ -455,10 +496,11 @@ export default function SaleCalendar() {
 
   // ---- Modals ----
   const [editing, setEditing] = useState<{
-    id: number;
+    id: number | null;
     name: string;
     startsAt: string;
     endsAt: string;
+    products: { id: string; title: string }[];
   } | null>(null);
   const [viewing, setViewing] = useState<(typeof sales)[number] | null>(null);
   const [deleting, setDeleting] = useState<{ id: number; name: string } | null>(null);
@@ -469,8 +511,46 @@ export default function SaleCalendar() {
       name: s.name,
       startsAt: toInputValue(s.startsAt, timezone),
       endsAt: toInputValue(s.endsAt, timezone),
+      products: s.products,
     });
-    overlay("edit-dates-modal")?.showOverlay();
+    overlay("sale-modal")?.showOverlay();
+  };
+
+  const openAdd = () => {
+    setEditing({ id: null, name: "", startsAt: "", endsAt: "", products: [] });
+    overlay("sale-modal")?.showOverlay();
+  };
+
+  // Product picker: keeps the current order, appends newly picked products.
+  const pickProducts = async () => {
+    if (!editing) return;
+    const picked = (await shopify.resourcePicker({
+      type: "product",
+      action: "select",
+      multiple: true,
+      filter: { variants: false },
+      selectionIds: editing.products.map((p) => ({ id: p.id })),
+    })) as { id: string; title: string }[] | undefined;
+    if (!picked) return;
+    const pickedIds = new Set(picked.map((p) => p.id));
+    const kept = editing.products.filter((p) => pickedIds.has(p.id));
+    const keptIds = new Set(kept.map((p) => p.id));
+    const added = picked.filter((p) => !keptIds.has(p.id)).map((p) => ({ id: p.id, title: p.title }));
+    setEditing({ ...editing, products: [...kept, ...added] });
+  };
+
+  const moveProduct = (index: number, delta: number) => {
+    if (!editing) return;
+    const next = [...editing.products];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    setEditing({ ...editing, products: next });
+  };
+
+  const removeProduct = (index: number) => {
+    if (!editing) return;
+    setEditing({ ...editing, products: editing.products.filter((_, i) => i !== index) });
   };
 
   const editProblem = editing
@@ -480,6 +560,7 @@ export default function SaleCalendar() {
       )
     : null;
   const nameProblem = editing && !editing.name.trim() ? "Enter a sale name." : null;
+  const productsProblem = editing && !editing.products.length ? "Add at least one product." : null;
 
   const scanning = scanCount !== null;
   const reading = parseFetcher.state !== "idle";
@@ -567,7 +648,12 @@ export default function SaleCalendar() {
               <s-stack direction="block" gap="small-200" alignItems="center">
                 <s-icon type="calendar" />
                 <s-heading>No sales yet</s-heading>
-                <s-text color="subdued">Upload the sale sheet below to get started.</s-text>
+                <s-text color="subdued">
+                  Add a sale manually, or upload the sale sheet below.
+                </s-text>
+                <s-button variant="primary" icon="plus" onClick={openAdd} disabled={busy}>
+                  Add sale
+                </s-button>
               </s-stack>
             </s-box>
           ) : (
@@ -582,6 +668,9 @@ export default function SaleCalendar() {
                     Show all
                   </s-button>
                 )}
+                <s-button icon="plus" onClick={openAdd} disabled={busy}>
+                  Add sale
+                </s-button>
               </s-stack>
               <s-table>
                 <s-table-header-row>
@@ -781,7 +870,7 @@ export default function SaleCalendar() {
                 {preview.some((s) => s.problems.length) && (
                   <s-text color="subdued">
                     Sales with date problems are saved but never run until their dates are
-                    fixed with &quot;Edit&quot;.
+                    fixed with &quot;Edit dates&quot;.
                   </s-text>
                 )}
                 <s-stack direction="inline" gap="base">
@@ -878,7 +967,7 @@ export default function SaleCalendar() {
       </s-section>
 
       {/* ---- Modals ---- */}
-      <s-modal id="edit-dates-modal" heading="Edit sale">
+      <s-modal id="sale-modal" heading={editing?.id == null ? "Add sale" : "Edit sale"}>
         {editing && (
           <s-stack direction="block" gap="base">
             <s-stack direction="block" gap="small-300">
@@ -920,30 +1009,93 @@ export default function SaleCalendar() {
               />
             </s-stack>
             <s-text color="subdued">Times are in the store time zone ({timezone}).</s-text>
-            {(nameProblem || editProblem) && (
-              <s-text tone="critical">{nameProblem || editProblem}</s-text>
+            {editProblem && <s-text tone="critical">{editProblem}</s-text>}
+            <s-divider />
+            <s-stack direction="inline" gap="small-200" alignItems="center" justifyContent="space-between">
+              <s-text type="strong">Products ({editing.products.length})</s-text>
+              <s-button icon="product" onClick={pickProducts}>
+                {editing.products.length ? "Add / remove products" : "Choose products"}
+              </s-button>
+            </s-stack>
+            {editing.products.length === 0 ? (
+              <s-text color="subdued">No products yet. They show in the store in this order.</s-text>
+            ) : (
+              <s-scroll-box maxBlockSize="300px">
+                <s-stack direction="block" gap="small-300">
+                  {editing.products.map((p, i) => (
+                    <s-box
+                      key={p.id}
+                      padding="small-200"
+                      borderWidth="base"
+                      borderRadius="base"
+                    >
+                      <s-stack
+                        direction="inline"
+                        gap="small-200"
+                        alignItems="center"
+                        justifyContent="space-between"
+                      >
+                        <s-text>
+                          {i + 1}. {p.title}
+                        </s-text>
+                        <s-button-group gap="none">
+                          <s-button
+                            slot="secondary-actions"
+                            icon="arrow-up"
+                            accessibilityLabel={`Move ${p.title} up`}
+                            disabled={i === 0}
+                            onClick={() => moveProduct(i, -1)}
+                          />
+                          <s-button
+                            slot="secondary-actions"
+                            icon="arrow-down"
+                            accessibilityLabel={`Move ${p.title} down`}
+                            disabled={i === editing.products.length - 1}
+                            onClick={() => moveProduct(i, 1)}
+                          />
+                          <s-button
+                            slot="secondary-actions"
+                            icon="x"
+                            tone="critical"
+                            accessibilityLabel={`Remove ${p.title}`}
+                            onClick={() => removeProduct(i)}
+                          />
+                        </s-button-group>
+                      </s-stack>
+                    </s-box>
+                  ))}
+                </s-stack>
+              </s-scroll-box>
             )}
+            {productsProblem && <s-text color="subdued">{productsProblem}</s-text>}
           </s-stack>
         )}
         <s-button
           slot="primary-action"
           variant="primary"
-          disabled={!editing || !!editProblem || !!nameProblem || (busy && busyIntent !== "updateDates")}
-          {...(busyIntent === "updateDates" ? { loading: true } : {})}
+          disabled={
+            !editing ||
+            !!editProblem ||
+            !!nameProblem ||
+            !!productsProblem ||
+            (busy && busyIntent !== "saveSale")
+          }
+          {...(busyIntent === "saveSale" ? { loading: true } : {})}
           onClick={() =>
             editing &&
             submit({
-              intent: "updateDates",
-              id: String(editing.id),
+              intent: "saveSale",
+              id: editing.id == null ? "" : String(editing.id),
               name: editing.name,
               startsAt: editing.startsAt,
               endsAt: editing.endsAt,
+              products: JSON.stringify(editing.products),
             })
           }
         >
-          Save
+          {editing?.id == null ? "Add sale" : "Save sale"}
         </s-button>
-        <s-button slot="secondary-actions" commandFor="edit-dates-modal" command="--hide">
+        <s-button slot="secondary-actions" commandFor="sale-modal" command="--hide">
           Cancel
         </s-button>
       </s-modal>

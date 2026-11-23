@@ -572,8 +572,11 @@ export default function SaleCalendar() {
       <s-link slot="breadcrumb-actions" href="/app">
         Home
       </s-link>
+      <s-button slot="primary-action" variant="primary" icon="plus" onClick={openAdd} disabled={busy}>
+        Add sale
+      </s-button>
       <s-button
-        slot="primary-action"
+        slot="secondary-actions"
         onClick={() => submit({ intent: "sync" })}
         disabled={noCollection || (busy && busyIntent !== "sync")}
         {...(busyIntent === "sync" ? { loading: true } : {})}

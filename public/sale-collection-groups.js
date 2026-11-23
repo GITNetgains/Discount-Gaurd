@@ -38,7 +38,7 @@
     [data-dg-sale-active][data-dg-sale-flow]{display:flex!important;flex-wrap:wrap;align-items:flex-start}
     [data-dg-sale-active] > :not([data-dg-sale-hidden]){clear:none!important;float:none!important;position:relative!important;top:auto!important;left:auto!important;right:auto!important;transform:none!important;opacity:1!important;visibility:visible!important}
     [data-dg-sale-active] > [data-dg-sale-hidden]{display:none!important}
-    [data-dg-sale-heading]{flex-shrink:0}
+    [data-dg-sale-heading]{flex-shrink:0;overflow:visible!important;height:auto!important;max-height:none!important}
   `;
 
   function loadImages(card) {
@@ -150,7 +150,8 @@
         } else divider?.remove();
         const heading = wrapper.querySelector('h2') || document.createElement('h2');
         if (heading.textContent !== group.name) heading.textContent = group.name;
-        heading.style.cssText = 'margin:0;text-align:left;';
+        // Themes often give h2 a line-height below 1, which clips tall glyphs at the top.
+        heading.style.cssText = 'margin:0;padding:0.15em 0 0;text-align:left;line-height:1.3;overflow:visible;';
         if (!heading.parentNode) wrapper.append(heading);
         const datesText = saleDates(group);
         let dates = wrapper.querySelector('[data-dg-sale-dates]');
